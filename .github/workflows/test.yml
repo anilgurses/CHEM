@@ -1,0 +1,101 @@
+name: Unit Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    if: github.actor != 'agurses_ncstate'
+    runs-on: ubuntu-22.04
+    env:
+      APT_CACHE_DIR: ${{ github.workspace }}/.ci-cache/apt
+      GTEST_CACHE_DIR: ${{ github.workspace }}/.ci-cache/gtest
+      MAVSDK_CACHE_DIR: ${{ github.workspace }}/.ci-cache/mavsdk
+      MAVSDK_DEB: libmavsdk-dev_1.4.16_ubuntu20.04_amd64.deb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore apt package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.APT_CACHE_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-apt-v2-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-apt-v2-
+
+      - name: Install system dependencies
+        run: |
+          mkdir -p "${APT_CACHE_DIR}/archives/partial"
+          sudo apt-get update
+          sudo apt-get -o dir::cache::archives="${APT_CACHE_DIR}/archives" install -y --no-install-recommends \
+            build-essential \
+            ccache \
+            cmake \
+            libboost-all-dev \
+            libuhd-dev \
+            libtbb-dev \
+            libsqlite3-dev \
+            libgtest-dev \
+            libvolk2-dev
+          sudo chown -R "$USER":"$USER" "${APT_CACHE_DIR}"
+
+      - name: Restore cached GTest build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GTEST_CACHE_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-gtest-v1
+
+      - name: Build and cache GTest
+        run: |
+          if [ ! -f "${GTEST_CACHE_DIR}/lib/libgtest.a" ]; then
+            cmake -S /usr/src/googletest -B /tmp/gtest-build -DCMAKE_INSTALL_PREFIX="${GTEST_CACHE_DIR}"
+            cmake --build /tmp/gtest-build -j"$(nproc)"
+            cmake --install /tmp/gtest-build
+          fi
+
+      - name: Restore MAVSDK package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MAVSDK_CACHE_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-mavsdk-v1-${{ env.MAVSDK_DEB }}
+
+      - name: Install MAVSDK
+        run: |
+          mkdir -p "${MAVSDK_CACHE_DIR}"
+          if [ ! -f "${MAVSDK_CACHE_DIR}/${MAVSDK_DEB}" ]; then
+            wget -q "https://github.com/mavlink/MAVSDK/releases/download/v1.4.16/${MAVSDK_DEB}" -O "${MAVSDK_CACHE_DIR}/${MAVSDK_DEB}"
+          fi
+          sudo dpkg -i "${MAVSDK_CACHE_DIR}/${MAVSDK_DEB}" || sudo apt-get install -f -y
+
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-${{ runner.arch }}-ccache-v1-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-ccache-v1-
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build && cd build
+          cmake .. \
+            -DCHEM_ENABLE_UNIT_TESTING=ON \
+            -DCMAKE_PREFIX_PATH="${GTEST_CACHE_DIR}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Show ccache stats
+        if: always()
+        run: ccache --show-stats || true

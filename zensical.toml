@@ -1,0 +1,90 @@
+[project]
+site_name = "CHEM"
+site_description = "Documentation for CHEM, a wireless channel emulator and experimentation toolkit."
+site_url = "https://docs.digitaltwin.sh"
+site_author = "Anil Gurses"
+copyright = "Copyright &copy; 2022-2026 Anil Gurses"
+repo_url = "https://github.com/anilgurses/CHEM"
+repo_name = "anilgurses/CHEM"
+extra_css = ["stylesheets/extra.css"]
+extra_javascript = [
+    "javascripts/mathjax.js",
+    "https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js",
+]
+nav = [
+    { Home = "index.md" },
+    { "Getting Started" = [
+        { Installation = "getting-started/installation.md" },
+        { Configuration = "getting-started/configuration.md" },
+    ] },
+    { Core = [
+        { Overview = "overview.md" },
+        { CHEM = "chem.md" },
+        { VUSRP = "vusrp.md" },
+        { "Channel Models" = "channel-models.md" },
+        { Antennas = "antennas.md" },
+        { "Under the Hood" = "under-the-hood.md" },
+    ] },
+    { Extensions = [
+        { "Extensions Overview" = "extensions.md" },
+        { "Sionna RT" = "sionna.md" },
+    ] },
+    { Tools = [
+        { PyCHEM = "pychem.md" },
+    ] },
+    { Reference = [
+        { "Extension Development" = "extension-development.md" },
+        { Benchmark = "benchmark.md" },
+        { "API Reference" = "api-reference.md" },
+    ] },
+]
+
+[project.theme]
+variant = "classic"
+logo = "img/chem_logo.png"
+favicon = "img/chem_favicon.png"
+features = [
+    "navigation.sections",
+    "navigation.expand",
+    "navigation.footer",
+    "navigation.top",
+    "navigation.indexes",
+    "search.suggest",
+    "search.highlight",
+    "content.code.copy",
+]
+
+[project.theme.font]
+text = "Roboto"
+code = "Roboto Mono"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "custom"
+accent = "custom"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "custom"
+accent = "custom"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[project.theme.icon]
+repo = "fontawesome/brands/git-alt"
+
+[project.extra.analytics]
+provider = "google"
+property = "G-NY2BLVJS7G"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/anilgurses/CHEM"
+name = "CHEM on GitHub"
+
+[[project.extra.social]]
+icon = "fontawesome/solid/paper-plane"
+link = "mailto:agurses@ncsu.edu"
+name = "Email Anil Gurses"

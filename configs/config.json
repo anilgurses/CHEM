@@ -1,0 +1,25 @@
+{
+    "controllerIpAddress" : "0.0.0.0",
+    "controllerPort" : 6000,
+    "coordIpaddress" : "0.0.0.0",
+    "coordPort" : 5000,
+    "maxNode" : 64,
+    "maxCores" : 10,
+    "numaEnabled" : false,
+    "logDirectory" : "/tmp/chem.log",
+    "logLevel" : "info",
+    "extensions": {
+        "sionna": {
+            "enabled": false,
+            "serverUrl": "http://localhost:8000",
+            "updateRateMs": 500,
+            "maxDepth": 3,
+            "numSamples": 10000,
+            "referenceOrigin": {
+                "lat": 35.7272,
+                "lon": -78.6960,
+                "alt": 0.0
+            }
+        }
+    }
+}
