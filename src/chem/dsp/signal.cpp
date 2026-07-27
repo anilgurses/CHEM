@@ -32,28 +32,37 @@ namespace signal {
 
 void fir_filter(const signal_v& signal, const signal_v& coeffs,
                 signal_v& filtered, const size_t size) {
-    size_t signal_len = signal.size();
-    size_t coeff_len = coeffs.size();
-    size_t delay = (coeff_len - 1) / 2;
+    const size_t signal_len = signal.size();
+    const size_t coeff_len = coeffs.size();
+    if (coeff_len == 0 || signal_len == 0) return;
 
-    int ext_signal_len = signal_len + delay * 2;
-    signal_v extended_signal(ext_signal_len);
+    const size_t delay = (coeff_len - 1) / 2;
+    // See the float-tap fir_filter below: pad by (coeff_len - 1) total plus
+    // kSimdSlack so VOLK's vectorized dot product never reads past the buffer.
+    const size_t right = coeff_len - 1 - delay;
+    constexpr size_t kSimdSlack = 16;
+
+    signal_v extended_signal(signal_len + delay + right + kSimdSlack,
+                             fc(0.0f, 0.0f));
 
     for (size_t i = 0; i < delay; i++) {
         extended_signal[i] = signal[0];
     }
     std::copy(signal.begin(), signal.begin() + size,
               extended_signal.begin() + delay);
-    for (size_t i = 0; i < delay; i++) {
+    for (size_t i = 0; i < right; i++) {
         extended_signal[delay + signal_len + i] = signal[signal_len - 1];
     }
+
+    signal_v padded_coeffs(coeffs);
+    padded_coeffs.resize(coeff_len + kSimdSlack, fc(0.0f, 0.0f));
 
     for (size_t i = 0; i < signal_len; ++i) {
         lv_32fc_t dot;
         volk_32fc_x2_dot_prod_32fc(
             &dot,
             reinterpret_cast<const lv_32fc_t*>(&extended_signal[i]),
-            reinterpret_cast<const lv_32fc_t*>(coeffs.data()),
+            reinterpret_cast<const lv_32fc_t*>(padded_coeffs.data()),
             static_cast<unsigned int>(coeff_len));
         filtered[i] = fc(reinterpret_cast<float*>(&dot)[0],
                          reinterpret_cast<float*>(&dot)[1]);
@@ -62,11 +71,18 @@ void fir_filter(const signal_v& signal, const signal_v& coeffs,
 
 void fir_filter(const signal_v& signal, const std::vector<float> coeffs,
                 signal_v& filtered, const size_t size) {
-    size_t coeff_len = coeffs.size();
-    size_t delay = (coeff_len - 1) / 2;
+    const size_t coeff_len = coeffs.size();
+    if (coeff_len == 0 || size == 0) return;
 
-    int ext_signal_len = size + delay * 2;
-    signal_v extended_signal(ext_signal_len);
+    const size_t delay = (coeff_len - 1) / 2;
+    // A full coeff_len window must be valid at i == size - 1, so the buffer
+    // needs (coeff_len - 1) padding samples total. Using 2*delay is one short
+    // for an even tap count. kSimdSlack adds headroom because VOLK's vectorized
+    // dot product can read a full SIMD register past coeff_len.
+    const size_t right = coeff_len - 1 - delay;
+    constexpr size_t kSimdSlack = 16;
+
+    signal_v extended_signal(size + delay + right + kSimdSlack, fc(0.0f, 0.0f));
 
     for (size_t i = 0; i < delay; i++) {
         extended_signal[i] = signal[0];
@@ -75,16 +91,21 @@ void fir_filter(const signal_v& signal, const std::vector<float> coeffs,
     std::copy(signal.begin(), signal.begin() + size,
               extended_signal.begin() + delay);
 
-    for (size_t i = 0; i < delay; i++) {
+    for (size_t i = 0; i < right; i++) {
         extended_signal[delay + size + i] = signal[size - 1];
     }
+
+    // Give the tap buffer the same over-read headroom; the padding zeros do not
+    // change the dot product result.
+    std::vector<float> padded_coeffs(coeffs);
+    padded_coeffs.resize(coeff_len + kSimdSlack, 0.0f);
 
     for (size_t i = 0; i < size; ++i) {
         lv_32fc_t dot;
         volk_32fc_32f_dot_prod_32fc(
             &dot,
             reinterpret_cast<const lv_32fc_t*>(&extended_signal[i]),
-            coeffs.data(),
+            padded_coeffs.data(),
             static_cast<unsigned int>(coeff_len));
         filtered[i] = fc(reinterpret_cast<float*>(&dot)[0],
                          reinterpret_cast<float*>(&dot)[1]);

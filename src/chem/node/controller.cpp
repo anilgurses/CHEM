@@ -15,6 +15,7 @@
 #include "chem/node/receiver.h"
 #include "chem/node/transmitter.h"
 #include "chem/numa_utils.h"
+#include "chem/runtime_config.h"
 
 using json = nlohmann::json;
 using namespace std::chrono_literals;
@@ -314,6 +315,7 @@ void Controller::AddNode(const Node& node) {
 bool Controller::AssignULChannel(Node& node, chem::NodeConfig newConfig) {
     if (newConfig.getChannels().empty()) return false;
 
+    const bool sandbox = RuntimeConfig::sandbox_enabled.load();
     const double freq = newConfig.getChannels().at(0).getTxFreq();
     const double prevFreq =
         node.getConfig().getChannels().empty()
@@ -325,16 +327,20 @@ bool Controller::AssignULChannel(Node& node, chem::NodeConfig newConfig) {
     bool prev_ch_found = FindChannel(prevFreq, prevCh_ptr);
 
     bool isSame = node.compare(newConfig);
-    auto receiver = node.getReceiver();
 
-    if (!receiver) {
-        receiver = CreateReceiver(node);
-        node.setReceiver(receiver);
+    // Receiver management is skipped in sandbox mode: no IQ is transported.
+    receiverSPtr receiver;
+    if (!sandbox) {
+        receiver = node.getReceiver();
+        if (!receiver) {
+            receiver = CreateReceiver(node);
+            node.setReceiver(receiver);
+        }
+        receiver->getNodeConfig().setInputFormat(
+            node.getConfig().getInputFormat());
+        receiver->getNodeConfig().setOutputFormat(
+            node.getConfig().getOutputFormat());
     }
-
-    receiver->getNodeConfig().setInputFormat(node.getConfig().getInputFormat());
-    receiver->getNodeConfig().setOutputFormat(
-        node.getConfig().getOutputFormat());
 
     if (!ch_found) {
         ch_ptr = CreateChannel(freq, newConfig.getSampleRate().getTxRate());
@@ -347,22 +353,35 @@ bool Controller::AssignULChannel(Node& node, chem::NodeConfig newConfig) {
     bool freqChanged = (std::abs(prevFreq - freq) >= 10e3);
 
     if (freqChanged && prev_ch_found) {
-        prevCh_ptr->DetachSource(receiver);
-        LOG_DEBUG("CONTROLLER",
-                  fmt::format("{:.1f} MHz Receiver released", prevFreq / 1e6));
+        if (sandbox) {
+            prevCh_ptr->removeSandboxNode(node.getConfig().getId());
+        } else {
+            prevCh_ptr->DetachSource(receiver);
+            LOG_DEBUG("CONTROLLER",
+                      fmt::format("{:.1f} MHz Receiver released",
+                                  prevFreq / 1e6));
+        }
         isChannelEmpty(prevCh_ptr);
     }
 
     if (!freqChanged) {
         node.getConfig().setSampleRate(newConfig.getSampleRate());
-        receiver->setSampleRate(node.getConfig().getSampleRate().getTxRate());
+        if (!sandbox) {
+            receiver->setSampleRate(
+                node.getConfig().getSampleRate().getTxRate());
+        }
         return false;
     }
 
     node.getConfig().updateTxFreq(freq, 0);
-    receiver->updateFreq(freq);
-    receiver->setSampleRate(node.getConfig().getSampleRate().getTxRate());
-    ch_ptr->AttachSource(receiver);
+    if (sandbox) {
+        ch_ptr->addSandboxNode(node.getConfig().getId(),
+                               newConfig.getNumChannels());
+    } else {
+        receiver->updateFreq(freq);
+        receiver->setSampleRate(node.getConfig().getSampleRate().getTxRate());
+        ch_ptr->AttachSource(receiver);
+    }
 
     return true;
 }
@@ -370,6 +389,7 @@ bool Controller::AssignULChannel(Node& node, chem::NodeConfig newConfig) {
 bool Controller::AssignDLChannel(Node& node, chem::NodeConfig newConfig) {
     if (newConfig.getChannels().empty()) return false;
 
+    const bool sandbox = RuntimeConfig::sandbox_enabled.load();
     const double freq = newConfig.getChannels().at(0).getRxFreq();
     const double prevFreq =
         node.getConfig().getChannels().empty()
@@ -381,17 +401,20 @@ bool Controller::AssignDLChannel(Node& node, chem::NodeConfig newConfig) {
     bool prev_ch_found = FindChannel(prevFreq, prevCh_ptr);
 
     bool isSame = node.compare(newConfig);
-    auto transmitter = node.getTransmitter();
 
-    if (!transmitter) {
-        transmitter = CreateTransmitter(node);
-        node.setTransmitter(transmitter);
+    // Transmitter management is skipped in sandbox mode: no IQ is transported.
+    transmitterSPtr transmitter;
+    if (!sandbox) {
+        transmitter = node.getTransmitter();
+        if (!transmitter) {
+            transmitter = CreateTransmitter(node);
+            node.setTransmitter(transmitter);
+        }
+        transmitter->getNodeConfig().setInputFormat(
+            node.getConfig().getInputFormat());
+        transmitter->getNodeConfig().setOutputFormat(
+            node.getConfig().getOutputFormat());
     }
-
-    transmitter->getNodeConfig().setInputFormat(
-        node.getConfig().getInputFormat());
-    transmitter->getNodeConfig().setOutputFormat(
-        node.getConfig().getOutputFormat());
 
     if (!ch_found) {
         ch_ptr = CreateChannel(freq, newConfig.getSampleRate().getRxRate());
@@ -404,23 +427,36 @@ bool Controller::AssignDLChannel(Node& node, chem::NodeConfig newConfig) {
     bool freqChanged = (std::abs(prevFreq - freq) >= 10e3);
 
     if (prev_ch_found && freqChanged) {
-        prevCh_ptr->DetachDestination(transmitter);
-        LOG_DEBUG("CONTROLLER", fmt::format("{:.1f} MHz Transmitter released",
-                                            prevFreq / 1e6));
+        if (sandbox) {
+            prevCh_ptr->removeSandboxNode(node.getConfig().getId());
+        } else {
+            prevCh_ptr->DetachDestination(transmitter);
+            LOG_DEBUG("CONTROLLER",
+                      fmt::format("{:.1f} MHz Transmitter released",
+                                  prevFreq / 1e6));
+        }
         isChannelEmpty(prevCh_ptr);
     }
 
     if (!freqChanged) {
         node.getConfig().setSampleRate(newConfig.getSampleRate());
-        transmitter->setSampleRate(
-            node.getConfig().getSampleRate().getRxRate());
+        if (!sandbox) {
+            transmitter->setSampleRate(
+                node.getConfig().getSampleRate().getRxRate());
+        }
         return false;
     }
 
     node.getConfig().updateRxFreq(freq, 0);
-    transmitter->updateFreq(freq);
-    transmitter->setSampleRate(node.getConfig().getSampleRate().getRxRate());
-    ch_ptr->AttachDestination(transmitter);
+    if (sandbox) {
+        ch_ptr->addSandboxNode(node.getConfig().getId(),
+                               newConfig.getNumChannels());
+    } else {
+        transmitter->updateFreq(freq);
+        transmitter->setSampleRate(
+            node.getConfig().getSampleRate().getRxRate());
+        ch_ptr->AttachDestination(transmitter);
+    }
 
     return true;
 }

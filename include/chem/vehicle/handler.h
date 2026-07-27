@@ -75,6 +75,9 @@ class Handler {
 
     std::atomic<bool> _running{false};
 
+    std::chrono::steady_clock::time_point m_lastPositionUpdate{};
+    std::chrono::steady_clock::time_point m_lastVelocityUpdate{};
+
     std::shared_ptr<System> m_system;
     Mavsdk mavsdk;
 };

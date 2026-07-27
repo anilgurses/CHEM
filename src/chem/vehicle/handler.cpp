@@ -15,11 +15,11 @@ using std::chrono::seconds;
 Handler::Handler(std::string connection, std::string nodeId, chem::Node& node)
     : connection_str(connection), m_NodeId(nodeId), m_node(&node) {
     mavsdk::log::subscribe(
-        [](mavsdk::log::Level level,    // message severity level
-           const std::string& message,  // message text
+        [](mavsdk::log::Level level,    
+           const std::string& message, 
            const std::string&
-               file,    // source file from which the message was sent
-           int line) {  // line number in the source file
+               file,    
+           int line) {   
             // returning true from the callback disables printing the message to
             // stdout
             return level < mavsdk::log::Level::Err;
@@ -97,19 +97,43 @@ void Handler::Start() {
     _running = true;
 
     // TODO: Optimize here
-    telemetry.subscribe_position([this](Telemetry::Position position) {
+    auto minUpdateInterval = []() {
+        return std::chrono::milliseconds(std::max(
+            20, chem::RuntimeConfig::vehicle_poll_rate_ms.load()));
+    };
+
+    telemetry.subscribe_position([this,
+                                  minUpdateInterval](Telemetry::Position
+                                                         position) {
         if (!_running) return;
+        // Drop updates that arrive faster than the requested poll rate. A real
+        // autopilot throttles the stream to set_rate_position(); a dumb replay (my recent replay_mission utility)
+        // does not, so we enforce it here to stay decoupled from source rate.
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_lastPositionUpdate < minUpdateInterval()) return;
+        m_lastPositionUpdate = now;
         relative_alt = position.relative_altitude_m;
         lat = position.latitude_deg;
         lon = position.longitude_deg;
         if (m_node) {
-            m_node->setLocation(chem::Location{lat, lon, relative_alt}, 10);
+            uint8_t logicalNode = 0;
+            if (m_node->getConfig().hasLogicalNode() &&
+                m_node->getConfig().getLogicalNode() >= 0) {
+                logicalNode =
+                    static_cast<uint8_t>(m_node->getConfig().getLogicalNode());
+            }
+            m_node->setLocation(chem::Location{lat, lon, relative_alt},
+                                logicalNode);
         }
     });
 
-    telemetry.subscribe_velocity_ned([this](Telemetry::VelocityNed vel) {
+    telemetry.subscribe_velocity_ned([this, minUpdateInterval](
+                                         Telemetry::VelocityNed vel) {
         if (!_running) return;
         if (!m_node) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_lastVelocityUpdate < minUpdateInterval()) return;
+        m_lastVelocityUpdate = now;
         chem::Velocity v;
         v.north = vel.north_m_s;
         v.east = vel.east_m_s;

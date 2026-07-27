@@ -23,6 +23,13 @@ import yaml
 MAX_JSON_LENGTH = 4096
 DEFAULT_CONFIG_PATH = Path("~/.config/uhd/conf.yaml").expanduser()
 TUI_POLL_TIMEOUT_MS = 200
+TX_ACTIVE_WINDOW_S = 5
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", s)
 
 CIR_SCENARIOS: dict[str, list[list[float]]] = {
     "None (clear)": [],
@@ -172,11 +179,61 @@ def _format_distance(value: Any) -> str:
         return str(value)
 
 
+def _is_tx_active(info: dict[str, Any]) -> bool:
+    if isinstance(info.get("txActive"), bool):
+        return bool(info.get("txActive"))
+    try:
+        return float(info.get("msSinceLastTx")) <= TX_ACTIVE_WINDOW_S * 1000
+    except Exception:
+        return False
+
+
+def _format_tx_marker(info: dict[str, Any]) -> str:
+    return "●" if _is_tx_active(info) else "○"
+
+
 def _safe_json(obj: Any) -> str:
     try:
         return json.dumps(obj, indent=2, sort_keys=True)
     except Exception:
         return str(obj)
+
+def _value_type(v: Any) -> str:
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, float):
+        return "float"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "list"
+    if isinstance(v, dict):
+        return "object"
+    return "null"
+
+
+def _flatten_scalars(data: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    out: list[tuple[str, Any]] = []
+    if not isinstance(data, dict):
+        return out
+    for k, v in data.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.extend(_flatten_scalars(v, prefix=f"{key}."))
+        elif isinstance(v, (bool, int, float, str)) or v is None:
+            out.append((key, v))
+    return out
+
+
+def _fmt_config_value(v: Any) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if v is None:
+        return "null"
+    return str(v)
+
 
 def _scale_complex_taps(taps: list[list[float]], scale: float) -> list[list[float]]:
     try:
@@ -189,6 +246,7 @@ def _scale_complex_taps(taps: list[list[float]], scale: float) -> list[list[floa
 
 
 def _format_node_row(name: str, info: dict[str, Any], widths: tuple[int, ...]) -> str:
+    tx_state = _format_tx_marker(info)
     tx = _format_mhz(info.get("txFreq", "-"))
     rx = _format_mhz(info.get("rxFreq", "-"))
     txr = _format_msa(info.get("txsampleRate", "-"))
@@ -218,22 +276,23 @@ def _format_node_row(name: str, info: dict[str, Any], widths: tuple[int, ...]) -
     fmt = (
         f"{{:<{widths[0]}}}  {{:<{widths[1]}}}  {{:<{widths[2]}}}  "
         f"{{:<{widths[3]}}}  {{:<{widths[4]}}}  {{:<{widths[5]}}}  "
-        f"{{:<{widths[6]}}}  {{:>{widths[7]}}}  {{:>{widths[8]}}}  "
-        f"{{:<{widths[9]}}}  {{:<{widths[10]}}}"
+        f"{{:<{widths[6]}}}  {{:<{widths[7]}}}  {{:>{widths[8]}}}  "
+        f"{{:>{widths[9]}}}  {{:<{widths[10]}}}  {{:<{widths[11]}}}"
     )
     rate = txr if txr != "0 MSa/s" else rxr
     return fmt.format(
-        _ellipsis(name, widths[0]).ljust(widths[0]),
-        _ellipsis(ident, widths[1]).ljust(widths[1]),
-        _ellipsis(tx, widths[2]).ljust(widths[2]),
-        _ellipsis(rx, widths[3]).ljust(widths[3]),
-        _ellipsis(ch, widths[4]).ljust(widths[4]),
-        _ellipsis(rate, widths[5]).ljust(widths[5]),
-        _ellipsis(antenna, widths[6]).ljust(widths[6]),
-        _ellipsis(tx_gain, widths[7]).rjust(widths[7]),
-        _ellipsis(rx_gain, widths[8]).rjust(widths[8]),
-        _ellipsis(veh, widths[9]).ljust(widths[9]),
-        _ellipsis(ntype, widths[10]).ljust(widths[10]),
+        _ellipsis(tx_state, widths[0]).ljust(widths[0]),
+        _ellipsis(name, widths[1]).ljust(widths[1]),
+        _ellipsis(ident, widths[2]).ljust(widths[2]),
+        _ellipsis(tx, widths[3]).ljust(widths[3]),
+        _ellipsis(rx, widths[4]).ljust(widths[4]),
+        _ellipsis(ch, widths[5]).ljust(widths[5]),
+        _ellipsis(rate, widths[6]).ljust(widths[6]),
+        _ellipsis(antenna, widths[7]).ljust(widths[7]),
+        _ellipsis(tx_gain, widths[8]).rjust(widths[8]),
+        _ellipsis(rx_gain, widths[9]).rjust(widths[9]),
+        _ellipsis(veh, widths[10]).ljust(widths[10]),
+        _ellipsis(ntype, widths[11]).ljust(widths[11]),
     )
 
 
@@ -310,7 +369,18 @@ class ChemClient:
             assert self.socket is not None
             self.socket.sendall(payload)
 
-            data = self.socket.recv(MAX_JSON_LENGTH).decode("utf-8", errors="replace").strip()
+            # Server terminates each response with '\n' (tcp_server.cpp:72).
+            # Read until the delimiter so large payloads (e.g. logs) aren't
+            # truncated mid-JSON.
+            chunks: list[bytes] = []
+            while True:
+                chunk = self.socket.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+            data = b"".join(chunks).decode("utf-8", errors="replace").strip()
             if not data:
                 return None
             return json.loads(data)
@@ -363,6 +433,13 @@ class ChemClient:
         resp = self._send({"CMD": "GET_STATUS"})
         return resp if isinstance(resp, dict) else {}
 
+    def get_logs(self, lines: int = 500) -> list[str]:
+        resp = self._send({"CMD": "GET_LOGS", "lines": int(lines)})
+        if isinstance(resp, dict):
+            out = resp.get("lines", [])
+            return [str(x) for x in out] if isinstance(out, list) else []
+        return []
+
     def get_config(self) -> dict[str, Any]:
         resp = self._send({"CMD": "GET_CONFIG"})
         return resp if isinstance(resp, dict) else {}
@@ -383,6 +460,22 @@ class ChemClient:
             body["cirMaxTaps"] = int(cir_max_taps)
         resp = self._send(body)
         return resp if isinstance(resp, dict) else {}
+
+    def get_config_file(self) -> dict[str, Any]:
+        resp = self._send({"CMD": "GET_CONFIG_FILE"})
+        return resp if isinstance(resp, dict) else {}
+
+    def save_config_file(
+        self,
+        config: Optional[dict[str, Any]] = None,
+        path: Optional[str] = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"CMD": "SAVE_CONFIG_FILE"}
+        if config is not None:
+            body["config"] = config
+        if path:
+            body["path"] = str(path)
+        return self._send(body) or {}
 
     def get_channels(self) -> dict[str, Any]:
         resp = self._send({"CMD": "GET_CHANNELS"})
@@ -521,17 +614,6 @@ class ChemClient:
     def set_source_power(
         self, node: str, source_power_dbfs: Optional[float] = None
     ) -> dict[str, Any]:
-        """Set the source power level (dBFS) for a node.
-
-        When set, processChannel() uses this fixed level instead of measured
-        average power for signal scaling and SNR, making both deterministic
-        regardless of bursty buffer content.
-
-        Args:
-            node: Node name or ID.
-            source_power_dbfs: Source level in dBFS (e.g. -12.0).
-                               Pass None to revert to measured power.
-        """
         body: dict[str, Any] = {"CMD": "CHG_SOURCE_POWER", "node": str(node)}
         if source_power_dbfs is not None:
             body["sourcePowerDbfs"] = float(source_power_dbfs)
@@ -626,24 +708,39 @@ class ChemClient:
         resp = self._send({"CMD": "EXT_LIST"})
         return resp if isinstance(resp, dict) else {}
 
+    def sandbox_status(self) -> dict[str, Any]:
+        return self.extension("sandbox", "status")
+
     # ---- Sionna RT  ----
 
     def sionna_start(
         self,
         server_url: str = "http://localhost:8000",
-        ref_lat: float = 35.7272,
-        ref_lon: float = -78.6960,
-        ref_alt: float = 0.0,
+        scene_config: str = "aerpaw",
+        ref_lat: float = 35.72750947,
+        ref_lon: float = -78.69595819,
+        ref_alt: float = 112.0,
+        offset_x: float = 118.1,
+        offset_y: float = -123.4,
+        offset_z: float = 0.0,
+        scale: float = 1.0,
         update_rate_ms: Optional[int] = None,
         max_depth: Optional[int] = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {
             "serverUrl": server_url,
+            "sceneConfig": scene_config,
             "referenceOrigin": {
                 "lat": ref_lat,
                 "lon": ref_lon,
                 "alt": ref_alt,
             },
+            "sceneOffset": {
+                "x": offset_x,
+                "y": offset_y,
+                "z": offset_z,
+            },
+            "scale": scale,
         }
         if update_rate_ms is not None:
             params["updateRateMs"] = int(update_rate_ms)
@@ -711,6 +808,12 @@ class Theme:
 
     def error(self) -> int:
         return curses.color_pair(4) | curses.A_BOLD if self.has_colors else curses.A_BOLD
+
+    def tx_active(self) -> int:
+        return curses.color_pair(3) | curses.A_BOLD if self.has_colors else curses.A_BOLD
+
+    def tx_inactive(self) -> int:
+        return curses.color_pair(5) | curses.A_DIM if self.has_colors else curses.A_DIM
 
 
 def _draw_box(stdscr: curses.window, y: int, x: int, h: int, w: int, title: str, theme: Theme) -> None:
@@ -913,14 +1016,16 @@ class App:
             "    / /__ / _  // _/ / /|_/ / ",
             "    \\___//_//_//___//_/  /_/   @ 2022",
         ]
+        self.footnote_line = "docs.digitaltwin.sh"
 
-        self.screen: str = "main"  # main | nodes | channels | status | config | profiles | extensions
+        self.screen: str = "main"  # main | nodes | channels | status | config | profiles | extensions | logs
         self.main_state = ListState(
             [
                 "Nodes",
                 "Channels",
                 "Profiles",
                 "Status",
+                "Logs",
                 "Config",
                 "Extensions",
                 "Set Default Propagation",
@@ -943,10 +1048,15 @@ class App:
         self.shadow_last_value: Optional[float] = None
         self.status_data: dict[str, Any] = {}
         self.status_last_fetch = 0.0
+        self.sandbox_enabled = False
         self._status_prev_cpu_ticks: Optional[int] = None
         self._status_prev_uptime: Optional[float] = None
         self.config_data: dict[str, Any] = {}
         self.config_last_fetch = 0.0
+        self.configfile_data: dict[str, Any] = {}
+        self.configfile_path: str = ""
+        self.config_rows: list[dict[str, Any]] = []
+        self.config_state = ListState([])
 
         self.profiles_list: list[str] = []
         self.profiles_map: dict[str, dict] = {}
@@ -954,6 +1064,12 @@ class App:
         self.profiles_detail_lines: list[str] = []
         self.extensions_data: dict[str, Any] = {}
         self.extensions_last_fetch = 0.0
+
+        self.logs_lines: list[str] = []
+        self.logs_scroll: int = 0
+        self.logs_follow: bool = True
+        self.logs_fetch_count: int = 500
+        self.logs_last_fetch: float = 0.0
 
     def _set_status(self, msg: str) -> None:
         self.status_line = msg
@@ -1039,9 +1155,10 @@ class App:
     def _refresh_links_list(self, max_width: int = 120) -> None:
         links = self._links_for_selected_freq()
 
-        headers = ("Channel", "Coeff", "SNR", "PL", "FO", "Dop", "CIR", "S", "Dist", "Elev", "Az")
+        headers = ("TX", "Channel", "Coeff", "SNR", "PL", "FO", "Dop", "CIR", "S", "Dist", "Elev", "Az")
         rows: list[tuple[str, ...]] = []
         for entry in links:
+            tx_state = _format_tx_marker(entry)
             src = entry.get("src", "?")
             dest = entry.get("dest", "?")
             coeff = entry.get("coeff", "?")
@@ -1063,6 +1180,7 @@ class App:
                     return str(val)
 
             rows.append((
+                tx_state,
                 channel,
                 _fmt_num(coeff, 3),
                 _fmt_num(snr, 2),
@@ -1077,6 +1195,7 @@ class App:
             ))
 
         w_total = max(20, int(max_width))
+        w_tx = 2
         w_coeff = 7
         w_snr = 6
         w_pl = 6
@@ -1088,7 +1207,7 @@ class App:
         w_elev = 6
         w_az = 6
         sep = "  "
-        fixed = w_coeff + w_snr + w_pl + w_fo + w_dop + w_cir + w_s + w_dist + w_elev + w_az
+        fixed = w_tx + w_coeff + w_snr + w_pl + w_fo + w_dop + w_cir + w_s + w_dist + w_elev + w_az
         sep_total = len(sep) * (len(headers) - 1)
         w_channel = max(8, w_total - fixed - sep_total)
         w_channel = min(w_channel, 24)
@@ -1100,8 +1219,9 @@ class App:
             return f"{s:{align}{w}}"
 
         def _row_to_str(row: tuple[str, ...]) -> str:
-            ch, coeff_s, snr_s, pl_s, fo_s, dop_s, cir_s, s_s, dist_s, elev_s, az_s = row
+            tx_s, ch, coeff_s, snr_s, pl_s, fo_s, dop_s, cir_s, s_s, dist_s, elev_s, az_s = row
             parts = [
+                _cell(tx_s, w_tx, "^"),
                 _cell(ch, w_channel, "<"),
                 _cell(coeff_s, w_coeff, ">"),
                 _cell(snr_s, w_snr, ">"),
@@ -1129,6 +1249,7 @@ class App:
                 headers[8],
                 headers[9],
                 headers[10],
+                headers[11],
             )
             self.links_header = _row_to_str(header_row)
             self.links_state.items = [_row_to_str(r) for r in rows]
@@ -1155,9 +1276,10 @@ class App:
             "nodes": "↑/↓ select node, auto-refresh (r to force), q back",
             "channels": "↑/↓ select, Tab switch, Enter actions, auto-refresh (r to force), q back",
             "status": "r refresh, q back",
-            "config": "Enter edit, r refresh, q back",
+            "config": "↑/↓ select, Enter edit, r refresh, q back",
             "profiles": "↑/↓ select, Enter apply, s save new, p set propagation, q back",
             "extensions": "Enter actions, r refresh, q back",
+            "logs": "↑/↓ scroll, PgUp/PgDn page, g top, G bottom, f follow, r refresh, c clear, q back",
         }.get(self.screen, "")
 
         try:
@@ -1170,6 +1292,12 @@ class App:
             if col < width:
                 stdscr.addnstr(0, col, suffix.ljust(width - col)[: width - col], width - col, theme.title())
             stdscr.addnstr(1, 0, help_line.ljust(width), width, theme.help())
+            if self.sandbox_enabled and width > 0:
+                note = "[ SANDBOX MODE ]"
+                if len(note) > width:
+                    note = _ellipsis("SANDBOX MODE", width)
+                x = max(0, width - len(note))
+                stdscr.addnstr(1, x, note, width - x, theme.error())
             stdscr.hline(2, 0, curses.ACS_HLINE, width)
         except curses.error:
             pass
@@ -1193,6 +1321,17 @@ class App:
         inner_h, inner_w = box_h - 2, box_w - 2
         if inner_h <= 0 or inner_w <= 0:
             return
+
+        def _draw_credit(area_x: int, area_w: int) -> None:
+            if inner_h < 2 or inner_w <= 0:
+                return
+            line = _ellipsis(self.footnote_line, max(0, area_w))
+            x = area_x + max(0, (area_w - len(line)) // 2)
+            y = inner_y + inner_h - 1
+            try:
+                stdscr.addnstr(y, x, line, max(0, area_w - (x - area_x)), theme.help())
+            except curses.error:
+                pass
 
         # Prefer a 2-column layout (menu left, banner right) when there's room.
         use_columns = inner_w >= 70 and inner_h >= 12
@@ -1227,13 +1366,16 @@ class App:
                         stdscr.addnstr(banner_y + i, banner_x, line[:banner_w], banner_w, theme.header())
                     except curses.error:
                         pass
+                _draw_credit(banner_x, banner_w)
             return
 
         # Fallback: banner at top, menu below (small terminals).
         banner_y = inner_y + 1
+        banner_x = inner_x + 1
+        banner_w = max(0, inner_w - 2)
         for i, line in enumerate(self.banner):
             try:
-                stdscr.addnstr(banner_y + i, inner_x + 1, line[: inner_w - 2], inner_w - 2, theme.header())
+                stdscr.addnstr(banner_y + i, banner_x, line[:banner_w], banner_w, theme.header())
             except curses.error:
                 pass
 
@@ -1246,6 +1388,7 @@ class App:
             self.main_state,
             theme,
         )
+        _draw_credit(banner_x, banner_w)
 
     def _render_nodes(self, stdscr: curses.window, theme: Theme) -> None:
         height, width = stdscr.getmaxyx()
@@ -1256,15 +1399,16 @@ class App:
         _draw_box(stdscr, y0, x0, content_h, content_w, "Nodes", theme)
 
         # Table header
-        headers = ("Name", "ID", "TxFreq", "RxFreq", "Ch", "Rate", "Antenna", "TxG(dBm)", "RxG(dBm)", "Vehicle", "Type")
+        headers = ("TX", "Name", "ID", "TxFreq", "RxFreq", "Ch", "Rate", "Antenna", "TxG(dBm)", "RxG(dBm)", "Vehicle", "Type")
         col_widths = (
-            max(10, content_w // 7),
-            max(6, content_w // 16),
-            max(9, content_w // 12),
-            max(9, content_w // 12),
+            2,
+            max(10, content_w // 8),
+            max(6, content_w // 18),
+            max(9, content_w // 13),
+            max(9, content_w // 13),
             4,
-            max(9, content_w // 12),
-            max(8, content_w // 12),
+            max(9, content_w // 13),
+            max(8, content_w // 13),
             7,
             7,
             max(7, content_w // 14),
@@ -1273,8 +1417,8 @@ class App:
         header_fmt = (
             f"{{:<{col_widths[0]}}}  {{:<{col_widths[1]}}}  {{:<{col_widths[2]}}}  "
             f"{{:<{col_widths[3]}}}  {{:<{col_widths[4]}}}  {{:<{col_widths[5]}}}  "
-            f"{{:<{col_widths[6]}}}  {{:>{col_widths[7]}}}  {{:>{col_widths[8]}}}  "
-            f"{{:<{col_widths[9]}}}  {{:<{col_widths[10]}}}"
+            f"{{:<{col_widths[6]}}}  {{:<{col_widths[7]}}}  {{:>{col_widths[8]}}}  "
+            f"{{:>{col_widths[9]}}}  {{:<{col_widths[10]}}}  {{:<{col_widths[11]}}}"
         )
         header_line = header_fmt.format(*headers)
         try:
@@ -1304,6 +1448,8 @@ class App:
             attr = theme.selected() if idx == self.nodes_state.selected else theme.normal()
             try:
                 stdscr.addnstr(table_y + row, x0 + 1, line[:table_w], table_w, attr)
+                dot_attr = theme.tx_active() if _is_tx_active(info) else theme.tx_inactive()
+                stdscr.addstr(table_y + row, x0 + 1, line[0], dot_attr)
             except curses.error:
                 pass
 
@@ -1425,12 +1571,79 @@ class App:
         ]
 
         y = 5
+        if self.sandbox_enabled:
+            note = "SANDBOX MODE ACTIVE"
+            try:
+                stdscr.addnstr(y, 4, _ellipsis(note, width - 8), width - 8, theme.error())
+            except curses.error:
+                pass
+            y += 2
+
         for line in lines:
             try:
                 stdscr.addnstr(y, 4, _ellipsis(line, width - 8), width - 8, theme.normal())
             except curses.error:
                 pass
             y += 1
+
+    def _render_logs(self, stdscr: curses.window, theme: Theme) -> None:
+        height, width = stdscr.getmaxyx()
+        box_y, box_x = 3, 2
+        box_h, box_w = height - 6, width - 4
+        follow_tag = "FOLLOW" if self.logs_follow else "PAUSED"
+        title = f"CHEM Logs ({len(self.logs_lines)} lines, {follow_tag})"
+        _draw_box(stdscr, box_y, box_x, box_h, box_w, title, theme)
+
+        inner_y, inner_x = box_y + 1, box_x + 1
+        inner_h, inner_w = box_h - 2, box_w - 2
+        if inner_h <= 0 or inner_w <= 0:
+            return
+
+        total = len(self.logs_lines)
+        if total == 0:
+            try:
+                stdscr.addnstr(inner_y, inner_x, "(no logs yet)", inner_w, theme.help())
+            except curses.error:
+                pass
+            return
+
+        if self.logs_follow:
+            self.logs_scroll = max(0, total - inner_h)
+        else:
+            self.logs_scroll = max(0, min(self.logs_scroll, total - 1))
+
+        start = self.logs_scroll
+        end = min(total, start + inner_h)
+        for row, idx in enumerate(range(start, end)):
+            line = self.logs_lines[idx]
+            attr = theme.normal()
+            low = line.lower()
+            if "[error]" in low or "[critical]" in low:
+                attr = theme.error()
+            elif "[warn" in low:
+                attr = theme.help()
+            elif "[info]" in low:
+                attr = theme.header()
+            try:
+                stdscr.addnstr(
+                    inner_y + row, inner_x, _ellipsis(line, inner_w), inner_w, attr
+                )
+            except curses.error:
+                pass
+
+    def _build_config_rows(self) -> None:
+        rows: list[dict[str, Any]] = []
+        rt = self.config_data or {}
+        for key in ("vehiclePollRateMs", "channelUpdateRateMs", "cirMaxTaps"):
+            if key in rt:
+                rows.append({"key": key, "value": rt.get(key),
+                             "type": "int", "source": "runtime"})
+        for dotted, value in _flatten_scalars(self.configfile_data):
+            rows.append({"key": dotted, "value": value,
+                         "type": _value_type(value), "source": "file"})
+        self.config_rows = rows
+        self.config_state.items = [r["key"] for r in rows]
+        self.config_state.clamp()
 
     def _enter_config(self) -> None:
         self._set_status("Fetching config…")
@@ -1444,109 +1657,125 @@ class App:
 
     def _render_config(self, stdscr: curses.window, theme: Theme) -> None:
         height, width = stdscr.getmaxyx()
-        _draw_box(stdscr, 3, 2, height - 6, width - 4, "CHEM Config", theme)
+        y0, x0 = 3, 2
+        content_h, content_w = height - 6, width - 4
+        path = self.configfile_path or "config.json"
+        _draw_box(stdscr, y0, x0, content_h, content_w, f"CHEM Config — {path}", theme)
 
-        data = self.config_data or {}
-        vehicle_ms = data.get("vehiclePollRateMs", "-")
-        channel_ms = data.get("channelUpdateRateMs", "-")
-        cir_max_taps = data.get("cirMaxTaps", "-")
+        inner_x = x0 + 1
+        table_w = content_w - 2
 
-        lines = [
-            "Vehicle poll rate:",
-            f"  {vehicle_ms} ms",
-            "",
-            "Channel update rate (coherency time):",
-            f"  {channel_ms} ms",
-            "",
-            "CIR max taps:",
-            f"  {cir_max_taps}",
-            "",
-            "Enter to edit, r to refresh",
-        ]
+        # Columns: Setting | Value | Type | Source
+        w_type = 7
+        w_source = 8
+        w_value = max(10, min(40, table_w // 3))
+        sep = "  "
+        w_key = max(10, table_w - w_value - w_type - w_source - len(sep) * 3)
 
-        y = 5
-        for line in lines:
+        def _row(key: str, value: str, typ: str, source: str) -> str:
+            return sep.join([
+                f"{_ellipsis(key, w_key):<{w_key}}",
+                f"{_ellipsis(value, w_value):<{w_value}}",
+                f"{_ellipsis(typ, w_type):<{w_type}}",
+                f"{_ellipsis(source, w_source):<{w_source}}",
+            ])
+
+        try:
+            stdscr.addnstr(y0 + 2, inner_x, _row("Setting", "Value", "Type", "Source"),
+                           table_w, theme.help())
+        except curses.error:
+            pass
+
+        if not self.config_rows:
             try:
-                stdscr.addnstr(y, 4, _ellipsis(line, width - 8), width - 8, theme.normal())
+                stdscr.addnstr(y0 + 4, inner_x, "(no config available)", table_w, theme.normal())
             except curses.error:
                 pass
-            y += 1
+            return
+
+        table_y = y0 + 3
+        visible = max(1, content_h - 4)
+        self.config_state.clamp()
+        if self.config_state.selected < self.config_state.scroll:
+            self.config_state.scroll = self.config_state.selected
+        if self.config_state.selected >= self.config_state.scroll + visible:
+            self.config_state.scroll = self.config_state.selected - visible + 1
+
+        for row in range(visible):
+            idx = self.config_state.scroll + row
+            if idx >= len(self.config_rows):
+                break
+            r = self.config_rows[idx]
+            line = _row(str(r["key"]), _fmt_config_value(r["value"]), r["type"], r["source"])
+            attr = theme.selected() if idx == self.config_state.selected else theme.normal()
+            try:
+                stdscr.addnstr(table_y + row, inner_x, line, table_w, attr)
+            except curses.error:
+                pass
 
     def _action_config(self, stdscr: curses.window, theme: Theme) -> None:
-        action = _modal_select(
-            stdscr,
-            theme,
-            "Config",
-            ["Set vehicle poll rate (ms)", "Set channel update rate (ms)", "Set CIR max taps", "Back"],
-        )
-        if not action or action == "Back":
+        if not self.config_rows:
             return
+        row = self.config_rows[self.config_state.selected]
+        key = row["key"]
+        typ = row["type"]
+        cur = row["value"]
+        source = row["source"]
 
-        if action == "Set vehicle poll rate (ms)":
-            initial = str(self.config_data.get("vehiclePollRateMs", 100))
-            raw = _modal_input(stdscr, theme, "Vehicle Poll Rate", "Vehicle poll rate (ms):", initial=initial)
-            if raw is None:
+        if typ == "bool":
+            choice = _modal_select(stdscr, theme, f"{key} (bool)", ["true", "false"])
+            if choice is None:
                 return
-            try:
-                val = int(float(raw))
-            except Exception:
-                self._set_status("Invalid poll rate")
-                return
-            try:
-                resp = self.client.set_config(vehicle_poll_rate_ms=val)
-                self.config_data = resp or self.client.get_config()
-                self._set_status("Vehicle poll rate updated")
-            except Exception as e:
-                self._set_status(f"Update failed: {e}")
-            return
-
-        if action == "Set channel update rate (ms)":
-            initial = str(self.config_data.get("channelUpdateRateMs", 100))
+            new_value: Any = (choice == "true")
+        elif typ in ("int", "float"):
             raw = _modal_input(
-                stdscr,
-                theme,
-                "Channel Update Rate",
-                "Channel update/coherency time (ms):",
-                initial=initial,
+                stdscr, theme, f"Edit {key}",
+                f"New {typ} value:", initial=_fmt_config_value(cur),
+            )
+            if raw is None or raw == "":
+                return
+            try:
+                new_value = int(float(raw)) if typ == "int" else float(raw)
+            except ValueError:
+                self._set_status(f"Invalid {typ}: {raw!r}")
+                return
+        elif typ == "string":
+            raw = _modal_input(
+                stdscr, theme, f"Edit {key}", "New value:",
+                initial=_fmt_config_value(cur),
             )
             if raw is None:
                 return
-            try:
-                val = int(float(raw))
-            except Exception:
-                self._set_status("Invalid update rate")
-                return
-            try:
-                resp = self.client.set_config(channel_update_rate_ms=val)
-                self.config_data = resp or self.client.get_config()
-                self._set_status("Channel update rate updated")
-            except Exception as e:
-                self._set_status(f"Update failed: {e}")
+            new_value = raw
+        else:
+            self._set_status(f"{key}: '{typ}' is not editable here")
             return
 
-        if action == "Set CIR max taps":
-            initial = str(self.config_data.get("cirMaxTaps", 64))
-            raw = _modal_input(
-                stdscr,
-                theme,
-                "CIR Max Taps",
-                "Maximum CIR taps allowed per link:",
-                initial=initial,
-            )
-            if raw is None:
-                return
-            try:
-                val = int(float(raw))
-            except Exception:
-                self._set_status("Invalid max taps")
-                return
-            try:
-                resp = self.client.set_config(cir_max_taps=val)
-                self.config_data = resp or self.client.get_config()
-                self._set_status("CIR max taps updated")
-            except Exception as e:
-                self._set_status(f"Update failed: {e}")
-            return
+        try:
+            if source == "runtime":
+                kwarg = {
+                    "vehiclePollRateMs": "vehicle_poll_rate_ms",
+                    "channelUpdateRateMs": "channel_update_rate_ms",
+                    "cirMaxTaps": "cir_max_taps",
+                }[key]
+                self.client.set_config(**{kwarg: int(new_value)})
+                note = "applied"
+            else:
+                patch: dict[str, Any] = {}
+                node = patch
+                parts = key.split(".")
+                for part in parts[:-1]:
+                    node = node.setdefault(part, {})
+                node[parts[-1]] = new_value
+                resp = self.client.save_config_file(patch)
+                if resp.get("status") != "success":
+                    self._set_status(f"Save failed: {resp.get('message', 'error')}")
+                    return
+                note = "saved to config.json"
+            self._fetch_config()
+            self._set_status(f"{key} = {_fmt_config_value(new_value)} ({note})")
+        except Exception as e:
+            self._set_status(f"Update failed: {e}")
 
     # ---- Extensions screen ----
 
@@ -1563,6 +1792,11 @@ class App:
     def _fetch_extensions(self) -> None:
         resp = self.client.extension_list()
         self.extensions_data = resp.get("extensions", {}) if isinstance(resp, dict) else {}
+        sandbox_status = self.extensions_data.get("sandbox")
+        if isinstance(sandbox_status, dict):
+            self.sandbox_enabled = bool(
+                sandbox_status.get("enabled", sandbox_status.get("running", False))
+            )
         self.extensions_last_fetch = time.time()
 
     def _render_extensions(self, stdscr: curses.window, theme: Theme) -> None:
@@ -1639,10 +1873,20 @@ class App:
                 )
                 if raw is None:
                     return None
-                try:
-                    parts[pname] = float(raw)
-                except ValueError:
-                    parts[pname] = raw.strip()
+                stripped = raw.strip()
+                ptype = pschema.get("type", "string") if isinstance(pschema, dict) else "string"
+                if ptype in ("number", "integer"):
+                    # Empty input falls back to the schema default rather than
+                    # being sent as "" (which the server rejects as non-numeric).
+                    candidate = stripped if stripped else str(sub_default).strip()
+                    if not candidate:
+                        continue
+                    try:
+                        parts[pname] = int(float(candidate)) if ptype == "integer" else float(candidate)
+                    except ValueError:
+                        continue
+                else:
+                    parts[pname] = stripped if stripped else str(sub_default)
             return json.dumps(parts)
         return _modal_input(stdscr, theme, field_name, f"{field_name}:", initial=initial)
 
@@ -1798,8 +2042,6 @@ class App:
         links = self._links_for_selected_freq() if freq_key else []
         propagation = summary.get("pathLoss", "-")
         if links:
-            # Prefer the per-link view, which reflects the live propagation model even if
-            # GET_CHANNELS (DB backed) lags behind.
             propagation = links[0].get("pathLoss", propagation)
         shadow = (
             f"{self.shadow_last_value:.2f}" if isinstance(self.shadow_last_value, (int, float)) else "-"
@@ -1830,7 +2072,6 @@ class App:
             except curses.error:
                 pass
 
-        # Links list (drawn inside bottom box)
         link_y = y0 + top_h + 2
         link_x = x0 + left_w + 2
         link_w = right_w - 2
@@ -1847,6 +2088,16 @@ class App:
         if self.channels_focus == "link":
             link_theme = theme
         _draw_list(stdscr, link_y, link_x, link_h, link_w, self.links_state, link_theme)
+        for row in range(max(0, link_h)):
+            idx = self.links_state.scroll + row
+            if idx >= len(links):
+                break
+            entry = links[idx]
+            dot_attr = theme.tx_active() if _is_tx_active(entry) else theme.tx_inactive()
+            try:
+                stdscr.addstr(link_y + row, link_x, _format_tx_marker(entry), dot_attr)
+            except curses.error:
+                pass
 
     def render(self, stdscr: curses.window, theme: Theme) -> None:
         stdscr.erase()
@@ -1866,6 +2117,8 @@ class App:
             self._render_profiles(stdscr, theme)
         elif self.screen == "extensions":
             self._render_extensions(stdscr, theme)
+        elif self.screen == "logs":
+            self._render_logs(stdscr, theme)
 
         self._draw_footer(stdscr, theme)
         stdscr.refresh()
@@ -1895,6 +2148,25 @@ class App:
             self._set_status(f"Warning: no connection to CHEM: {e}")
         except Exception as e:
             self._set_status(f"Channels error: {e}")
+
+    def _enter_logs(self) -> None:
+        self.logs_follow = True
+        self.logs_scroll = 0
+        self._set_status("Fetching logs…")
+        try:
+            self._fetch_logs()
+            self._set_status(
+                f"Logs: {len(self.logs_lines)} lines (f follow, g/G top/bottom, q back)"
+            )
+        except ChemConnectionError as e:
+            self._set_status(f"Warning: no connection to CHEM: {e}")
+        except Exception as e:
+            self._set_status(f"Logs error: {e}")
+
+    def _fetch_logs(self) -> None:
+        lines = self.client.get_logs(self.logs_fetch_count)
+        self.logs_lines = [_strip_ansi(ln).rstrip("\r\n") for ln in lines]
+        self.logs_last_fetch = time.time()
 
     def _channels_refresh_all(self) -> None:
         self._fetch_channels()
@@ -1949,10 +2221,35 @@ class App:
             data["cpuPercentNow"] = cpu_now
 
         self.status_data = data
+        if "sandboxEnabled" in data:
+            self.sandbox_enabled = bool(data.get("sandboxEnabled", False))
+        else:
+            try:
+                self._fetch_sandbox_status()
+            except Exception:
+                pass
         self.status_last_fetch = time.time()
+
+    def _fetch_sandbox_status(self) -> None:
+        data = self.client.sandbox_status()
+        if isinstance(data, dict):
+            self.sandbox_enabled = bool(
+                data.get("enabled", data.get("running", False))
+            )
 
     def _fetch_config(self) -> None:
         self.config_data = self.client.get_config()
+        try:
+            resp = self.client.get_config_file()
+        except Exception:
+            resp = {}
+        if isinstance(resp, dict) and resp.get("status") == "success":
+            self.configfile_data = resp.get("config", {}) or {}
+            self.configfile_path = str(resp.get("path", ""))
+        else:
+            self.configfile_data = {}
+            self.configfile_path = ""
+        self._build_config_rows()
         self.config_last_fetch = time.time()
 
     def _auto_refresh(self) -> None:
@@ -1983,6 +2280,11 @@ class App:
                 self._fetch_extensions()
             except Exception as e:
                 self._set_status(f"Extensions refresh error: {e}")
+        if self.screen == "logs" and (now - self.logs_last_fetch) >= self.auto_refresh_interval:
+            try:
+                self._fetch_logs()
+            except Exception as e:
+                self._set_status(f"Logs refresh error: {e}")
 
     def _action_channels_freq(self, stdscr: curses.window, theme: Theme) -> None:
         freq_key = self._selected_freq_key()
@@ -2312,7 +2614,7 @@ class App:
         )
         if not model:
             return
-        model = model.split(" (")[0]  # strip label suffix
+        model = model.split(" (")[0]  
         ground = -1.0
         scenario: Optional[str] = None
         environment: Optional[str] = None
@@ -2610,6 +2912,9 @@ class App:
                 elif choice == "Extensions":
                     self.screen = "extensions"
                     self._enter_extensions()
+                elif choice == "Logs":
+                    self.screen = "logs"
+                    self._enter_logs()
                 elif choice == "Set Default Propagation":
                     self._action_set_default_propagation(stdscr, theme)
             elif key in (ord("q"), 27):
@@ -2691,15 +2996,17 @@ class App:
             return True
 
         if self.screen == "config":
-            if key in (ord("r"),):
+            if key in (curses.KEY_UP, ord("k")):
+                self.config_state.move(-1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.config_state.move(1)
+            elif key in (ord("r"),):
                 try:
                     self._enter_config()
                 except Exception as e:
                     self._set_status(f"Refresh failed: {e}")
-                return True
-            if key in (curses.KEY_ENTER, 10, 13):
+            elif key in (curses.KEY_ENTER, 10, 13):
                 self._action_config(stdscr, theme)
-                return True
             return True
 
         if self.screen == "profiles":
@@ -2729,6 +3036,45 @@ class App:
                 return True
             return True
 
+        if self.screen == "logs":
+            height, _ = stdscr.getmaxyx()
+            page = max(1, height - 8)
+            total = len(self.logs_lines)
+            if key in (curses.KEY_UP, ord("k")):
+                self.logs_follow = False
+                self.logs_scroll = max(0, self.logs_scroll - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.logs_scroll = min(max(0, total - 1), self.logs_scroll + 1)
+                if self.logs_scroll >= max(0, total - page):
+                    self.logs_follow = True
+            elif key in (curses.KEY_PPAGE,):
+                self.logs_follow = False
+                self.logs_scroll = max(0, self.logs_scroll - page)
+            elif key in (curses.KEY_NPAGE,):
+                self.logs_scroll = min(max(0, total - 1), self.logs_scroll + page)
+                if self.logs_scroll >= max(0, total - page):
+                    self.logs_follow = True
+            elif key == ord("g"):
+                self.logs_follow = False
+                self.logs_scroll = 0
+            elif key == ord("G"):
+                self.logs_follow = True
+                self.logs_scroll = max(0, total - page)
+            elif key == ord("f"):
+                self.logs_follow = not self.logs_follow
+                self._set_status(f"Follow: {'on' if self.logs_follow else 'off'}")
+            elif key == ord("c"):
+                self.logs_lines = []
+                self.logs_scroll = 0
+                self._set_status("Log view cleared")
+            elif key == ord("r"):
+                try:
+                    self._fetch_logs()
+                    self._set_status(f"Logs: {len(self.logs_lines)} lines")
+                except Exception as e:
+                    self._set_status(f"Refresh failed: {e}")
+            return True
+
         return True
 
 
@@ -2744,6 +3090,7 @@ def run_tui(client: ChemClient) -> None:
         app._set_status(f"Connecting to CHEM {client.addr}:{client.port}…")
         try:
             app._fetch_version()
+            app._fetch_sandbox_status()
             app._set_status("Connected")
         except ChemConnectionError as e:
             app.version = "Unknown"

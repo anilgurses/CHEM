@@ -54,6 +54,9 @@ bool SionnaExtension::onStart(const json& config) {
     if (config.contains("numSamples") && config["numSamples"].is_number()) {
         m_numSamples = std::max(1000, config["numSamples"].get<int>());
     }
+    if (config.contains("sceneConfig") && config["sceneConfig"].is_string()) {
+        m_sceneConfig = config["sceneConfig"].get<std::string>();
+    }
     if (config.contains("referenceOrigin") &&
         config["referenceOrigin"].is_object()) {
         const auto& ref = config["referenceOrigin"];
@@ -63,6 +66,18 @@ bool SionnaExtension::onStart(const json& config) {
             m_refLon = ref["lon"].get<double>();
         if (ref.contains("alt") && ref["alt"].is_number())
             m_refAlt = ref["alt"].get<double>();
+    }
+    if (config.contains("sceneOffset") && config["sceneOffset"].is_object()) {
+        const auto& off = config["sceneOffset"];
+        if (off.contains("x") && off["x"].is_number())
+            m_offsetX = off["x"].get<double>();
+        if (off.contains("y") && off["y"].is_number())
+            m_offsetY = off["y"].get<double>();
+        if (off.contains("z") && off["z"].is_number())
+            m_offsetZ = off["z"].get<double>();
+    }
+    if (config.contains("scale") && config["scale"].is_number()) {
+        m_scale = config["scale"].get<double>();
     }
 
     if (m_serverUrl.empty()) {
@@ -122,10 +137,62 @@ json SionnaExtension::handleCommand(const std::string& action,
         if (params.contains("numSamples") && params["numSamples"].is_number()) {
             m_numSamples = std::max(1000, params["numSamples"].get<int>());
         }
+        if (params.contains("sceneConfig") &&
+            params["sceneConfig"].is_string()) {
+            m_sceneConfig = params["sceneConfig"].get<std::string>();
+        }
+        if (params.contains("referenceOrigin") &&
+            params["referenceOrigin"].is_object()) {
+            const auto& ref = params["referenceOrigin"];
+            if (ref.contains("lat") && ref["lat"].is_number())
+                m_refLat = ref["lat"].get<double>();
+            if (ref.contains("lon") && ref["lon"].is_number())
+                m_refLon = ref["lon"].get<double>();
+            if (ref.contains("alt") && ref["alt"].is_number())
+                m_refAlt = ref["alt"].get<double>();
+            // Push to Sionna if scene already exists
+            if (!m_sceneId.empty()) {
+                json origBody;
+                origBody["lat"] = m_refLat;
+                origBody["lon"] = m_refLon;
+                origBody["alt"] = m_refAlt;
+                try {
+                    httpPut("/scenes/" + m_sceneId + "/update_origin",
+                            origBody.dump());
+                    LOG_INFO("SIONNA",
+                             fmt::format("Updated scene origin to ({:.6f}, "
+                                         "{:.6f}, {:.1f})",
+                                         m_refLat, m_refLon, m_refAlt));
+                } catch (const std::exception& e) {
+                    LOG_WARN("SIONNA",
+                             fmt::format("Failed to update scene origin: {}",
+                                         e.what()));
+                }
+            }
+        }
+        if (params.contains("sceneOffset") &&
+            params["sceneOffset"].is_object()) {
+            const auto& off = params["sceneOffset"];
+            if (off.contains("x") && off["x"].is_number())
+                m_offsetX = off["x"].get<double>();
+            if (off.contains("y") && off["y"].is_number())
+                m_offsetY = off["y"].get<double>();
+            if (off.contains("z") && off["z"].is_number())
+                m_offsetZ = off["z"].get<double>();
+        }
+        if (params.contains("scale") && params["scale"].is_number()) {
+            m_scale = params["scale"].get<double>();
+        }
         resp["status"] = "success";
         resp["updateRateMs"] = m_updateRateMs;
         resp["maxDepth"] = m_maxDepth;
         resp["numSamples"] = m_numSamples;
+        resp["sceneConfig"] = m_sceneConfig;
+        resp["referenceOrigin"] = {
+            {"lat", m_refLat}, {"lon", m_refLon}, {"alt", m_refAlt}};
+        resp["sceneOffset"] = {
+            {"x", m_offsetX}, {"y", m_offsetY}, {"z", m_offsetZ}};
+        resp["scale"] = m_scale;
     } else {
         resp["status"] = "fail";
         resp["message"] = "Unknown action: " + action;
@@ -143,11 +210,18 @@ json SionnaExtension::getStatus() const {
     resp["updateRateMs"] = m_updateRateMs;
     resp["maxDepth"] = m_maxDepth;
     resp["numSamples"] = m_numSamples;
+    resp["sceneConfig"] = m_sceneConfig;
     resp["referenceOrigin"] = {
         {"lat", m_refLat},
         {"lon", m_refLon},
         {"alt", m_refAlt}
     };
+    resp["sceneOffset"] = {
+        {"x", m_offsetX}, {"y", m_offsetY}, {"z", m_offsetZ}};
+    resp["scale"] = m_scale;
+    if (!m_sceneAlignment.is_null()) {
+        resp["sceneAlignment"] = m_sceneAlignment;
+    }
     if (m_cirResponseCount > 0) {
         resp["avgCirResponseMs"] = std::round(m_avgCirResponseMs * 10.0) / 10.0;
     }
@@ -160,17 +234,22 @@ json SionnaExtension::getConfigSchema() const {
         {"updateRateMs", {{"type", "integer"}, {"default", 500}, {"min", 50}}},
         {"maxDepth", {{"type", "integer"}, {"default", 3}, {"min", 1}}},
         {"numSamples", {{"type", "integer"}, {"default", 100000}, {"min", 1000}}},
+        {"sceneConfig", {{"type", "string"}, {"default", "aerpaw"}}},
         {"referenceOrigin", {{"type", "object"}, {"properties", {
-            {"lat", {{"type", "number"}}},
-            {"lon", {{"type", "number"}}},
-            {"alt", {{"type", "number"}}}
-        }}}}
+            {"lat", {{"type", "number"}, {"default", 35.72750947}}},
+            {"lon", {{"type", "number"}, {"default", -78.69595819}}},
+            {"alt", {{"type", "number"}, {"default", 112.0}}}
+        }}}},
+        {"sceneOffset", {{"type", "object"}, {"properties", {
+            {"x", {{"type", "number"}, {"default", 118.1}}},
+            {"y", {{"type", "number"}, {"default", -123.4}}},
+            {"z", {{"type", "number"}, {"default", 0.0}}}
+        }}}},
+        {"scale", {{"type", "number"}, {"default", 1.0}}}
     };
 }
 
-// ---------------------------------------------------------------------------
 // Extension flag management
-// ---------------------------------------------------------------------------
 
 void SionnaExtension::clearExtensionFlags() {
     if (!m_intermediateMap) return;
@@ -184,9 +263,7 @@ void SionnaExtension::clearExtensionFlags() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // HTTP helpers
-// ---------------------------------------------------------------------------
 
 std::string SionnaExtension::httpGet(const std::string& target) {
     net::io_context ioc;
@@ -271,9 +348,18 @@ std::string SionnaExtension::httpPut(const std::string& target,
     return res.body();
 }
 
-// ---------------------------------------------------------------------------
+// Link-budget helpers
+
+double SionnaExtension::destSampleRate(const std::string& destId,
+                                       double fallback) const {
+    if (!m_nodeMap) return fallback;
+    auto it = m_nodeMap->find(destId);
+    if (it == m_nodeMap->end()) return fallback;
+    const double rx = it->second.getConfig().getSampleRate().getRxRate();
+    return rx > 0.0 ? rx : fallback;
+}
+
 // CIR -> FIR tap conversion
-// ---------------------------------------------------------------------------
 
 chem::signal_v SionnaExtension::cirToTaps(
     const std::vector<double>& delays, const std::vector<double>& gains_re,
@@ -303,18 +389,23 @@ chem::signal_v SionnaExtension::cirToTaps(
     return taps;
 }
 
-// ---------------------------------------------------------------------------
 // Scene creation
-// ---------------------------------------------------------------------------
 
 bool SionnaExtension::createScene() {
     try {
         json createBody;
+        createBody["scene_config"] = m_sceneConfig;
         createBody["scene_origin"] = {
             {"lat", m_refLat},
             {"lon", m_refLon},
             {"alt", m_refAlt}
         };
+        createBody["scene_offset"] = {
+            {"x", m_offsetX},
+            {"y", m_offsetY},
+            {"z", m_offsetZ}
+        };
+        createBody["scale"] = m_scale;
 
         std::string response = httpPost("/scenes", createBody.dump());
         json respJson = json::parse(response);
@@ -324,20 +415,45 @@ bool SionnaExtension::createScene() {
         }
         m_sceneId = respJson["scene_id"].get<std::string>();
         LOG_INFO("SIONNA",
-                 fmt::format("Created scene: {} (origin: {:.6f}, {:.6f}, {:.1f})",
-                             m_sceneId, m_refLat, m_refLon, m_refAlt));
+                 fmt::format("Created scene: {} (config='{}', origin: {:.6f}, "
+                             "{:.6f}, {:.1f} HAE, offset: {:.1f}, {:.1f}, "
+                             "{:.1f}, scale: {:.3f})",
+                             m_sceneId, m_sceneConfig, m_refLat, m_refLon,
+                             m_refAlt, m_offsetX, m_offsetY, m_offsetZ,
+                             m_scale));
     } catch (const std::exception& e) {
         LOG_WARN("SIONNA",
                  fmt::format("Failed to create scene: {}", e.what()));
         return false;
     }
 
+    fetchSceneAlignment();
+
     return true;
 }
 
-// ---------------------------------------------------------------------------
+void SionnaExtension::fetchSceneAlignment() {
+    if (m_sceneId.empty()) return;
+    try {
+        std::string response = httpGet("/scenes/" + m_sceneId);
+        json info = json::parse(response);
+
+        json alignment;
+        for (const char* key :
+             {"scene_config", "scene_path", "offset", "scale", "units"}) {
+            if (info.contains(key)) alignment[key] = info[key];
+        }
+        m_sceneAlignment = alignment;
+
+        LOG_INFO("SIONNA",
+                 fmt::format("Scene alignment confirmed: {}", alignment.dump()));
+    } catch (const std::exception& e) {
+        LOG_WARN("SIONNA",
+                 fmt::format("Failed to fetch scene alignment: {}", e.what()));
+    }
+}
+
 // Poll loop
-// ---------------------------------------------------------------------------
 
 void SionnaExtension::pollLoop() {
     // Create a scene before starting the sync loop
@@ -362,9 +478,7 @@ void SionnaExtension::pollLoop() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Position sync
-// ---------------------------------------------------------------------------
 
 void SionnaExtension::syncPositions() {
     if (m_sceneId.empty() || !m_nodeMap) return;
@@ -390,11 +504,19 @@ void SionnaExtension::syncPositions() {
                                           ? nodeId
                                           : node.getConfig().getName();
 
+        // The server expects position alt in the same HAE datum as
+        // scene_origin.alt (ground level). CHEM node altitudes come from the
+        // vehicle's relative_altitude_m (AGL, height above the takeoff/home
+        // point), so shift them onto the HAE ground reference: a device on the
+        // ground (AGL 0) maps to scene_origin.alt, a drone 35m up maps to
+        // scene_origin.alt + 35.
+        const double haeAlt = static_cast<double>(loc.alt) + m_refAlt;
+
         // Build GeoPosition object for the API
         json posObj;
         posObj["lat"] = loc.lat;
         posObj["lon"] = loc.lon;
-        posObj["alt"] = static_cast<double>(loc.alt);
+        posObj["alt"] = haeAlt;
 
         // Sionna requires unique names across TX and RX, so suffix them
         const std::string txName = nodeName + "-tx";
@@ -405,6 +527,8 @@ void SionnaExtension::syncPositions() {
             json txBody;
             txBody["name"] = txName;
             txBody["position"] = posObj;
+            // Keep Sionna normalized; CHEM applies device/PA/cable gains
+            // locally in Channel::processChannel().
             txBody["signal_power"] = 0.0;
             txBody["velocity"] = {{"x", 0.0}, {"y", 0.0}, {"z", 0.0}};
             try {
@@ -413,14 +537,13 @@ void SionnaExtension::syncPositions() {
                 m_txOrder.push_back(txName);
                 LOG_INFO("SIONNA",
                          fmt::format(
-                             "Registered TX '{}' at ({:.6f}, {:.6f}, {:.1f})",
-                             txName, loc.lat, loc.lon, loc.alt));
+                             "Registered TX '{}' at ({:.6f}, {:.6f}, {:.1f} HAE)",
+                             txName, loc.lat, loc.lon, haeAlt));
             } catch (const std::exception& e) {
                 LOG_WARN("SIONNA", fmt::format("Failed to register TX '{}': {}",
                                                txName, e.what()));
             }
         } else {
-            // Update existing position
             json updateBody;
             updateBody["position"] = posObj;
             try {
@@ -443,8 +566,8 @@ void SionnaExtension::syncPositions() {
                 m_rxOrder.push_back(rxName);
                 LOG_INFO("SIONNA",
                          fmt::format(
-                             "Registered RX '{}' at ({:.6f}, {:.6f}, {:.1f})",
-                             rxName, loc.lat, loc.lon, loc.alt));
+                             "Registered RX '{}' at ({:.6f}, {:.6f}, {:.1f} HAE)",
+                             rxName, loc.lat, loc.lon, haeAlt));
             } catch (const std::exception& e) {
                 LOG_WARN("SIONNA", fmt::format("Failed to register RX '{}': {}",
                                                rxName, e.what()));
@@ -464,9 +587,7 @@ void SionnaExtension::syncPositions() {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Compute and apply CIR from Sionna
-// ---------------------------------------------------------------------------
 
 void SionnaExtension::computeAndApplyCIR() {
     if (m_sceneId.empty() || !m_intermediateMap) return;
@@ -601,11 +722,9 @@ void SionnaExtension::computeAndApplyCIR() {
 
             if (delays.empty()) continue;
 
-            // Apply to each intermediate frequency
             const chId ch{0, 0};
+            const double sampleRate = destSampleRate(destId, 1e6);
             for (auto& [freq, intermediate] : *m_intermediateMap) {
-                double sampleRate = freq > 0 ? 1e6 : 1e6;
-
                 auto taps =
                     cirToTaps(delays, gains_re, gains_im, sampleRate);
                 if (taps.empty()) continue;

@@ -177,6 +177,11 @@ void Intermediate::ProcessSignal(WorkerContext& ctx,
         return;
     }
 
+    ctx.last_tx_ns.store(
+        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch())
+            .count(),
+        std::memory_order_release);
+
     SignalContext sig_ctx{};
     sig_ctx.src_n_ch = sig->getNumberOfChannels();
     sig_ctx.i_sz_ch = sig->getSizePerBuff();
@@ -675,6 +680,20 @@ bool Intermediate::DetachSource(receiverSPtr receiver) {
     return true;
 }
 
+std::vector<std::pair<std::string, int64_t>> Intermediate::getTxActivity()
+    const {
+    std::vector<std::pair<std::string, int64_t>> activity;
+    std::lock_guard<std::mutex> guard(m_workers_mutex);
+    activity.reserve(m_workers.size());
+    for (const auto& [receiver_id, ctx] : m_workers) {
+        if (!ctx) continue;
+        activity.emplace_back(
+            ctx->src_node_id,
+            ctx->last_tx_ns.load(std::memory_order_acquire));
+    }
+    return activity;
+}
+
 void Intermediate::EmptyChannelChecker() {
     if (isEmpty()) {
         work.store(false, std::memory_order_release);
@@ -689,47 +708,71 @@ void Intermediate::EmptyChannelChecker() {
 // Channel Map Management
 // ----------------------------------------------------------------------------
 
+PathLossType Intermediate::currentPlType() const {
+    switch (m_propagationModel) {
+        case PropagationModel::TWO_RAY:
+            return PathLossType::twoRay;
+        case PropagationModel::THREE_GPP_38_901:
+            return PathLossType::threeGPP_38_901;
+        case PropagationModel::OKUMURA_HATA:
+            return PathLossType::okumuraHata;
+        case PropagationModel::LONGLEY_RICE:
+            return PathLossType::longleyRice;
+        case PropagationModel::NONE:
+        case PropagationModel::UNKNOWN:
+        case PropagationModel::FREE_SPACE:
+        default:
+            return PathLossType::freeSpace;
+    }
+}
+
+void Intermediate::insertChannelIfMissing(const std::string& src_id,
+                                          const std::string& dest_id,
+                                          uint8_t destNumCh,
+                                          uint8_t srcNumCh) {
+    if (m_channelMap.find({src_id, dest_id}) != m_channelMap.end()) return;
+
+    Channel t_ch(src_id, dest_id, destNumCh, srcNumCh);
+    t_ch.updatePlType(currentPlType());
+    t_ch.update3gppScenario(m_3gppScenario);
+    t_ch.updateHataEnvironment(m_hataEnvironment);
+    t_ch.updateITMParams(m_itmRefractivity, m_itmGroundConductivity,
+                         m_itmGroundPermittivity, m_itmClimateZone);
+    m_channelMap.emplace(std::make_pair(src_id, dest_id), t_ch);
+}
+
 void Intermediate::updateChannelMap() {
+    // Real source -> real destination channels
     for (auto& src : m_sourceMap) {
         for (auto& dest : m_destinationMap) {
-            auto dest_id = dest.second->getId();
-            auto src_id = src.second->getId();
-            auto it = m_channelMap.find({src_id, dest_id});
-            if (it == m_channelMap.end()) {
-                Channel t_ch(src_id, dest_id, dest.second->getNumChannels(),
-                             src.second->getNumChannels());
+            insertChannelIfMissing(src.second->getId(), dest.second->getId(),
+                                   dest.second->getNumChannels(),
+                                   src.second->getNumChannels());
+        }
+    }
 
-                // Ensure new channels inherit current pathloss + model
-                // configuration.
-                auto pathLossType = PathLossType::freeSpace;
-                switch (m_propagationModel) {
-                    case PropagationModel::TWO_RAY:
-                        pathLossType = PathLossType::twoRay;
-                        break;
-                    case PropagationModel::THREE_GPP_38_901:
-                        pathLossType = PathLossType::threeGPP_38_901;
-                        break;
-                    case PropagationModel::OKUMURA_HATA:
-                        pathLossType = PathLossType::okumuraHata;
-                        break;
-                    case PropagationModel::LONGLEY_RICE:
-                        pathLossType = PathLossType::longleyRice;
-                        break;
-                    case PropagationModel::NONE:
-                    case PropagationModel::UNKNOWN:
-                    case PropagationModel::FREE_SPACE:
-                    default:
-                        pathLossType = PathLossType::freeSpace;
-                        break;
-                }
-                t_ch.updatePlType(pathLossType);
-                t_ch.update3gppScenario(m_3gppScenario);
-                t_ch.updateHataEnvironment(m_hataEnvironment);
-                t_ch.updateITMParams(m_itmRefractivity, m_itmGroundConductivity,
-                                     m_itmGroundPermittivity, m_itmClimateZone);
-
-                m_channelMap.emplace(std::make_pair(src_id, dest_id), t_ch);
-            }
+    // Sandbox node cross-product (sandbox nodes act as both src and dest).
+    // Mixed deployments also link sandbox nodes with real endpoints.
+    for (const auto& nodeA : m_sandboxNodes) {
+        const uint8_t chA = static_cast<uint8_t>(
+            m_sandboxNumChannels.count(nodeA)
+                ? m_sandboxNumChannels.at(nodeA)
+                : 1);
+        for (const auto& nodeB : m_sandboxNodes) {
+            if (nodeA == nodeB) continue;
+            const uint8_t chB = static_cast<uint8_t>(
+                m_sandboxNumChannels.count(nodeB)
+                    ? m_sandboxNumChannels.at(nodeB)
+                    : 1);
+            insertChannelIfMissing(nodeA, nodeB, chB, chA);
+        }
+        for (auto& dest : m_destinationMap) {
+            insertChannelIfMissing(nodeA, dest.second->getId(),
+                                   dest.second->getNumChannels(), chA);
+        }
+        for (auto& src : m_sourceMap) {
+            insertChannelIfMissing(src.second->getId(), nodeA, chA,
+                                   src.second->getNumChannels());
         }
     }
 }
@@ -1054,7 +1097,8 @@ void Intermediate::printStatus() {
 }
 
 bool Intermediate::isEmpty() const {
-    return m_destinationMap.empty() && m_sourceMap.empty();
+    return m_destinationMap.empty() && m_sourceMap.empty() &&
+           m_sandboxNodes.empty();
 }
 
 uint8_t Intermediate::GetDestinationCnt() const {
@@ -1123,4 +1167,37 @@ void Intermediate::add2Queue(std::unique_ptr<chem::Signal> sig) {
     if (sig) {
         m_iq_pools[0]->release(sig->dataArray());
     }
+}
+
+// ----------------------------------------------------------------------------
+// Sandbox Node Lifecycle
+// ----------------------------------------------------------------------------
+
+void Intermediate::addSandboxNode(const std::string& nodeId,
+                                  size_t numChannels) {
+    std::unique_lock<std::shared_mutex> guard(dest_mutex);
+    m_sandboxNodes.insert(nodeId);
+    m_sandboxNumChannels[nodeId] = numChannels;
+    updateChannelMap();
+    m_destVersion.fetch_add(1, std::memory_order_release);
+
+    LOG_INFO("INTERMEDIATE",
+             fmt::format("Sandbox node '{}' added to {} MHz Channel (numCh={})",
+                         nodeId, HZ_TO_MHZ(m_freq), numChannels));
+}
+
+void Intermediate::removeSandboxNode(const std::string& nodeId) {
+    std::unique_lock<std::shared_mutex> guard(dest_mutex);
+    m_sandboxNodes.erase(nodeId);
+    m_sandboxNumChannels.erase(nodeId);
+    removeChannel(nodeId);
+    m_destVersion.fetch_add(1, std::memory_order_release);
+
+    LOG_INFO("INTERMEDIATE",
+             fmt::format("Sandbox node '{}' removed from {} MHz Channel",
+                         nodeId, HZ_TO_MHZ(m_freq)));
+}
+
+const std::set<std::string>& Intermediate::getSandboxNodes() const {
+    return m_sandboxNodes;
 }

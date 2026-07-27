@@ -8,6 +8,11 @@
     "numaEnabled" : false,
     "logDirectory" : "/tmp/chem.log",
     "logLevel" : "info",
+    "sandbox": {
+        "enabled": false,
+        "middlemanUrl": "http://localhost:8080",
+        "updateRateMs": 500
+    },
     "extensions": {
         "sionna": {
             "enabled": false,
@@ -15,11 +20,18 @@
             "updateRateMs": 500,
             "maxDepth": 3,
             "numSamples": 10000,
+            "sceneConfig": "aerpaw",
             "referenceOrigin": {
-                "lat": 35.7272,
-                "lon": -78.6960,
-                "alt": 0.0
-            }
+                "lat": 35.72750947,
+                "lon": -78.69595819,
+                "alt": 112.0
+            },
+            "sceneOffset": {
+                "x": 118.1,
+                "y": -123.4,
+                "z": 0.0
+            },
+            "scale": 1.0
         }
     }
 }

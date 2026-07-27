@@ -6,6 +6,7 @@
 #include <string>
 
 #include "../common.h"
+#include "../config.h"
 #include "../nlohmann/json.hpp"
 #include "../node/node_entity.h"
 #include "channel.h"
@@ -23,7 +24,8 @@ class Coordinator : public std::enable_shared_from_this<Coordinator> {
         std::map<std::string, chem::Node>& nodeMap,
         std::map<double, std::shared_ptr<chem::Intermediate>>& intermediate_map,
         std::shared_ptr<chem::PropagationDefaults> propagationDefaults =
-            nullptr);
+            nullptr,
+        chem::Config* config = nullptr);
     ~Coordinator();
 
     void start();
@@ -96,6 +98,8 @@ class Coordinator : public std::enable_shared_from_this<Coordinator> {
     uint8_t m_numChannels;
 
     TCPServer m_tcpServer;
+
+    chem::Config* m_config = nullptr;
 
     chem::ExtensionRegistry m_extensionRegistry;
 };

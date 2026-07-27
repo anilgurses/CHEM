@@ -519,6 +519,22 @@ void Node::refreshFromConfig(
         setCharacteristics(characteristics);
         nodeConfig.setCharacteristics(characteristics);
         m_config.setCharacteristics(characteristics);
+    } else if (nodeType == chem::NodeType::VEHICLE_MAVPROXY) {
+        // A vehicle (MAVProxy) node has no inherent RF characteristics. Without
+        // them the link budget has no source power and P_RX collapses to inf,
+        // corrupting the signal. Fall back to the AERPAW portable-node (PN)
+        // profile unless the config already specifies characteristics.
+        if (nodeConfig.hasCharacteristics()) {
+            const auto& characteristics = nodeConfig.getCharacteristics();
+            setCharacteristics(*characteristics);
+            m_config.setCharacteristics(*characteristics);
+        } else {
+            const auto characteristics =
+                chem::aerpaw::portable_node::characteristics();
+            setCharacteristics(characteristics);
+            nodeConfig.setCharacteristics(characteristics);
+            m_config.setCharacteristics(characteristics);
+        }
     } else {
         clearCharacteristics();
         nodeConfig.clearCharacteristics();

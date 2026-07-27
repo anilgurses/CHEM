@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -20,11 +21,14 @@
 #include <optional>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include "chem/antennas/antennas.h"
 #include "chem/common.h"
 #include "chem/db/dbHandler.h"
+#include "chem/logger.hpp"
 #include "chem/runtime_config.h"
+#include "middleman_client.h"
 #include "sionna_client.h"
 
 using namespace chem;
@@ -45,6 +49,7 @@ std::map<double, double> shadow_std_by_freq;
 int _tmp_dist = 0;
 
 static const auto g_proc_start = std::chrono::steady_clock::now();
+static constexpr auto TX_ACTIVE_WINDOW = std::chrono::seconds{5};
 
 static std::string resolveNodeId(
     const std::map<std::string, chem::Node>& nodeMap, const std::string& raw) {
@@ -60,22 +65,64 @@ static std::string resolveNodeId(
     return raw;
 }
 
+static int64_t steadyNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+static std::map<std::string, int64_t> collectTxActivity(
+    const std::map<double, std::shared_ptr<chem::Intermediate>>&
+        intermediateMap) {
+    std::map<std::string, int64_t> latest;
+    for (const auto& entry : intermediateMap) {
+        const auto& intermediate = entry.second;
+        if (!intermediate) continue;
+        for (const auto& [src_id, last_tx_ns] : intermediate->getTxActivity()) {
+            auto it = latest.find(src_id);
+            if (it == latest.end() || last_tx_ns > it->second) {
+                latest[src_id] = last_tx_ns;
+            }
+        }
+    }
+    return latest;
+}
+
+static void addTxActivityFields(json& target, int64_t last_tx_ns,
+                                int64_t now_ns) {
+    if (last_tx_ns <= 0) {
+        target["msSinceLastTx"] = nullptr;
+        target["txActive"] = false;
+        return;
+    }
+
+    const int64_t elapsed_ns = std::max<int64_t>(0, now_ns - last_tx_ns);
+    const auto elapsed = std::chrono::nanoseconds{elapsed_ns};
+    target["msSinceLastTx"] =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+    target["txActive"] = elapsed <= TX_ACTIVE_WINDOW;
+}
+
 // TODO: Convert these std::map's to struct
 Coordinator::Coordinator(
     const std::string& ipv4addr, const uint16_t& portNum,
     std::map<std::string, Node>& nodeMap,
     std::map<double, std::shared_ptr<Intermediate>>& intermediate_map,
-    std::shared_ptr<chem::PropagationDefaults> propagationDefaults)
+    std::shared_ptr<chem::PropagationDefaults> propagationDefaults,
+    chem::Config* config)
     : m_ipAddress(ipv4addr),
       m_portNum(portNum),
       m_nodeMap(nodeMap),
       m_intermediateMap(intermediate_map),
       m_propagationDefaults(std::move(propagationDefaults)),
-      m_tcpServer() {
+      m_tcpServer(),
+      m_config(config) {
     // Extensions
     m_extensionRegistry.setContext(m_nodeMap, m_intermediateMap);
     m_extensionRegistry.registerExtension(
         std::make_unique<chem::SionnaExtension>());
+    m_extensionRegistry.registerExtension(
+        std::make_unique<chem::SandboxExtension>());
 }
 
 Coordinator::~Coordinator() {}
@@ -173,8 +220,61 @@ void Coordinator::requestHandler(const std::string& request,
         cfg["cirMaxTaps"] = chem::RuntimeConfig::cir_max_taps.load();
         cfg["extensions"] = m_extensionRegistry.getAllStatus();
         response = cfg.dump();
+    } else if (coord_info["CMD"] == "GET_CONFIG_FILE") {
+        json r;
+        if (m_config) {
+            r["status"] = "success";
+            r["path"] = m_config->getConfigPath();
+            r["config"] = m_config->raw();
+        } else {
+            r["status"] = "fail";
+            r["message"] = "Config file not available";
+        }
+        response = r.dump();
+    } else if (coord_info["CMD"] == "SAVE_CONFIG_FILE") {
+        json r;
+        if (!m_config) {
+            r["status"] = "fail";
+            r["message"] = "Config file not available";
+        } else {
+            if (coord_info.contains("config") &&
+                coord_info["config"].is_object()) {
+                m_config->mergePatch(coord_info["config"]);
+            }
+            std::string path;
+            if (coord_info.contains("path") && coord_info["path"].is_string()) {
+                path = coord_info["path"].get<std::string>();
+            }
+            const bool ok = m_config->save(path);
+            r["status"] = ok ? "success" : "fail";
+            if (!ok) r["message"] = "Failed to write config file";
+            r["path"] = path.empty() ? m_config->getConfigPath() : path;
+            r["config"] = m_config->raw();
+        }
+        response = r.dump();
     } else if (coord_info["CMD"] == "GET_STATUS") {
         response = getStatus();
+    } else if (coord_info["CMD"] == "GET_LOGS") {
+        size_t lines = 500;
+        if (coord_info.contains("lines") &&
+            coord_info["lines"].is_number_integer()) {
+            auto v = coord_info["lines"].get<long long>();
+            if (v < 0) v = 0;
+            lines = static_cast<size_t>(std::min<long long>(
+                v, static_cast<long long>(log_ringbuffer_capacity)));
+        }
+        auto rb = chem::Logger::getRingBuffer();
+        json r;
+        if (rb) {
+            r["status"] = "success";
+            r["lines"] = rb->last_formatted(lines);
+            r["capacity"] = static_cast<uint64_t>(log_ringbuffer_capacity);
+        } else {
+            r["status"] = "fail";
+            r["message"] = "Log ring buffer not initialized";
+            r["lines"] = json::array();
+        }
+        response = r.dump();
     } else if (coord_info["CMD"] == "GET_ANTENNA_PATTERNS") {
         response = getAntennaPatterns();
     } else if (coord_info["CMD"] == "CHG_ANTENNA") {
@@ -532,10 +632,12 @@ void Coordinator::requestHandler(const std::string& request,
     } else if (coord_info["CMD"] == "EXT") {
         const std::string extName = coord_info.value("extension", "");
         const std::string action = coord_info.value("action", "");
-        json params = coord_info.contains("params") ? coord_info["params"] : json::object();
+        json params = coord_info.contains("params") ? coord_info["params"]
+                                                    : json::object();
         // Merge top-level keys into params for convenience
         for (auto& [k, v] : coord_info.items()) {
-            if (k != "CMD" && k != "extension" && k != "action" && k != "params") {
+            if (k != "CMD" && k != "extension" && k != "action" &&
+                k != "params") {
                 params[k] = v;
             }
         }
@@ -559,8 +661,34 @@ void Coordinator::requestHandler(const std::string& request,
 }
 
 void Coordinator::updateChannels() {
+    // For debugging, will likely remove on my next push
+    using clock = std::chrono::steady_clock;
+    auto next_drop_log = clock::now() + std::chrono::seconds(5);
+    std::unordered_map<double, std::pair<size_t, size_t>> last_counts;
+
     while (running) {
         configChannels();
+
+        if (clock::now() >= next_drop_log) {
+            for (auto& inm : m_intermediateMap) {
+                const double freq = inm.first;
+                const size_t pool_drops = inm.second->getPoolDropCount();
+                const size_t age_drops = inm.second->getWorkerAgeDropCount();
+                auto& prev = last_counts[freq];
+                const size_t d_pool = pool_drops - prev.first;
+                const size_t d_age = age_drops - prev.second;
+                if (pool_drops > 0 || age_drops > 0) {
+                    LOG_INFO("COORDINATOR",
+                             fmt::format("Drops @ {:.3f} MHz: pool={} (+{}) "
+                                         "age={} (+{})",
+                                         HZ_TO_MHZ(freq), pool_drops, d_pool,
+                                         age_drops, d_age));
+                }
+                prev = {pool_drops, age_drops};
+            }
+            next_drop_log = clock::now() + std::chrono::seconds(5);
+        }
+
         const int rate_ms =
             std::max(1, chem::RuntimeConfig::channel_update_rate_ms.load());
         std::this_thread::sleep_for(std::chrono::milliseconds(rate_ms));
@@ -569,100 +697,97 @@ void Coordinator::updateChannels() {
 
 // TODO: Add poll rate
 void Coordinator::configChannels() {
-    for (auto& inm : m_intermediateMap) {
-        auto& channels = inm.second->getChannelList();
-
-        for (auto& pair : channels) {
-            auto& ch = pair.second;
-            const std::string node_1 = ch.getSrc();
-            const std::string node_2 = ch.getDest();
-
-            auto findLoc = [&](const std::string& key)
-                -> std::optional<chem::NodeLocation> {
-                auto nodeIt = m_nodeMap.find(key);
-                if (nodeIt != m_nodeMap.end()) {
-                    if (auto loc = nodeIt->second.getLocation();
-                        loc.has_value())
-                        return loc;
-                }
-                // Fallback: match by name across nodes
-                for (const auto& pair : m_nodeMap) {
-                    if (pair.second.getConfig().getName() == key) {
-                        if (auto loc = pair.second.getLocation();
-                            loc.has_value())
-                            return loc;
-                    }
-                }
-                return std::nullopt;
-            };
-
-            auto loc1Opt = findLoc(node_1);
-            auto loc2Opt = findLoc(node_2);
-
-            if (!loc1Opt.has_value() || !loc2Opt.has_value()) continue;
-
-            auto loc1 = loc1Opt->position;
-            auto lat1 = loc1.lat;
-            auto lon1 = loc1.lon;
-            auto alt1 = loc1.alt;
-
-            auto loc2 = loc2Opt->position;
-            auto lat2 = loc2.lat;
-            auto lon2 = loc2.lon;
-            auto alt2 = loc2.alt;
-
-            double dist = calcDistance(lat1, lon1, lat2, lon2);
-            double azimuth = calcAzimuth(lat1, lon1, lat2, lon2);
-            double d_alt =
-                alt2 -
-                alt1;  // Signed altitude difference (positive = dest is higher)
-            // Elevation angle: positive when looking up, negative when looking
-            // down
-            double elev = (dist > 0.01) ? atan(d_alt / dist) * 180 / PI : 0.0;
-
-            ch.updateDistance(dist);
-            ch.updateAltitude(std::abs(d_alt));
-            ch.updateHeights(static_cast<float>(alt1),
-                             static_cast<float>(alt2));
-            ch.updateElevation(elev);
-            ch.updateAzimuth(azimuth);
-
-            if (ch.isDopplerEnabled()) {
-                constexpr double meters_per_deg = 111319.5;
-                const double lat_avg_rad =
-                    ((lat1 + lat2) * 0.5) * (static_cast<double>(PI) / 180.0);
-                const double north_m = (lat2 - lat1) * meters_per_deg;
-                const double east_m =
-                    (lon2 - lon1) * meters_per_deg * std::cos(lat_avg_rad);
-                const double up_m = static_cast<double>(alt2 - alt1);
-                const double range_m = std::sqrt(
-                    east_m * east_m + north_m * north_m + up_m * up_m);
-                if (range_m > 0.01) {
-                    const double ux = east_m / range_m;
-                    const double uy = north_m / range_m;
-                    const double uz = up_m / range_m;
-
-                    const auto v1 = loc1Opt->velocity;
-                    const auto v2 = loc2Opt->velocity;
-                    const double vx_rel =
-                        static_cast<double>(v2.east - v1.east);
-                    const double vy_rel =
-                        static_cast<double>(v2.north - v1.north);
-                    const double vz_rel = static_cast<double>(v2.up - v1.up);
-                    const double range_rate_mps =
-                        vx_rel * ux + vy_rel * uy + vz_rel * uz;
-
-                    const double carrier_hz = inm.first;
-                    const double doppler_hz =
-                        -(range_rate_mps /
-                          static_cast<double>(SPEED_OF_LIGHT)) *
-                        carrier_hz;
-                    ch.setDopplerHz(doppler_hz);
-                } else {
-                    ch.setDopplerHz(0.0);
-                }
+    auto findLoc =
+        [&](const std::string& key) -> std::optional<chem::NodeLocation> {
+        auto nodeIt = m_nodeMap.find(key);
+        if (nodeIt != m_nodeMap.end()) {
+            if (auto loc = nodeIt->second.getLocation(); loc.has_value())
+                return loc;
+        }
+        // Fallback: match by name across nodes
+        for (const auto& pair : m_nodeMap) {
+            if (pair.second.getConfig().getName() == key) {
+                if (auto loc = pair.second.getLocation(); loc.has_value())
+                    return loc;
             }
         }
+        return std::nullopt;
+    };
+
+    for (auto& inm : m_intermediateMap) {
+        const double carrier_hz = inm.first;
+        inm.second->withChannelsExclusive([&](auto& channels) {
+            for (auto& pair : channels) {
+                auto& ch = pair.second;
+                const std::string node_1 = ch.getSrc();
+                const std::string node_2 = ch.getDest();
+
+                auto loc1Opt = findLoc(node_1);
+                auto loc2Opt = findLoc(node_2);
+
+                if (!loc1Opt.has_value() || !loc2Opt.has_value()) continue;
+
+                auto loc1 = loc1Opt->position;
+                auto lat1 = loc1.lat;
+                auto lon1 = loc1.lon;
+                auto alt1 = loc1.alt;
+
+                auto loc2 = loc2Opt->position;
+                auto lat2 = loc2.lat;
+                auto lon2 = loc2.lon;
+                auto alt2 = loc2.alt;
+
+                double dist = calcDistance(lat1, lon1, lat2, lon2);
+                double azimuth = calcAzimuth(lat1, lon1, lat2, lon2);
+                double d_alt = alt2 - alt1;
+                double elev =
+                    (dist > 0.01) ? atan(d_alt / dist) * 180 / PI : 0.0;
+
+                ch.updateDistance(dist);
+                ch.updateAltitude(std::abs(d_alt));
+                ch.updateHeights(static_cast<float>(alt1),
+                                 static_cast<float>(alt2));
+                ch.updateElevation(elev);
+                ch.updateAzimuth(azimuth);
+
+                if (ch.isDopplerEnabled()) {
+                    constexpr double meters_per_deg = 111319.5;
+                    const double lat_avg_rad =
+                        ((lat1 + lat2) * 0.5) *
+                        (static_cast<double>(PI) / 180.0);
+                    const double north_m = (lat2 - lat1) * meters_per_deg;
+                    const double east_m =
+                        (lon2 - lon1) * meters_per_deg * std::cos(lat_avg_rad);
+                    const double up_m = static_cast<double>(alt2 - alt1);
+                    const double range_m = std::sqrt(
+                        east_m * east_m + north_m * north_m + up_m * up_m);
+                    if (range_m > 0.01) {
+                        const double ux = east_m / range_m;
+                        const double uy = north_m / range_m;
+                        const double uz = up_m / range_m;
+
+                        const auto v1 = loc1Opt->velocity;
+                        const auto v2 = loc2Opt->velocity;
+                        const double vx_rel =
+                            static_cast<double>(v2.east - v1.east);
+                        const double vy_rel =
+                            static_cast<double>(v2.north - v1.north);
+                        const double vz_rel =
+                            static_cast<double>(v2.up - v1.up);
+                        const double range_rate_mps =
+                            vx_rel * ux + vy_rel * uy + vz_rel * uz;
+
+                        const double doppler_hz =
+                            -(range_rate_mps /
+                              static_cast<double>(SPEED_OF_LIGHT)) *
+                            carrier_hz;
+                        ch.setDopplerHz(doppler_hz);
+                    } else {
+                        ch.setDopplerHz(0.0);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -715,6 +840,8 @@ std::string Coordinator::getChannels() {
 
 std::string Coordinator::getIndividualChannels() {
     json j;
+    const auto tx_activity = collectTxActivity(m_intermediateMap);
+    const int64_t now_ns = steadyNowNs();
 
     for (auto& inm : m_intermediateMap) {
         auto fr_str = std::to_string(inm.first / 1000000);
@@ -782,6 +909,11 @@ std::string Coordinator::getIndividualChannels() {
                 entry["cirTapCount"] = channel.getChTapCount(l.first);
                 entry["extensionActive"] = channel.isExtensionActive();
                 entry["activeExtension"] = channel.getActiveExtension();
+                auto activity_it = tx_activity.find(channel.getSrc());
+                addTxActivityFields(
+                    entry,
+                    activity_it != tx_activity.end() ? activity_it->second : 0,
+                    now_ns);
                 j[fr_str].push_back(std::move(entry));
             }
         }
@@ -792,6 +924,8 @@ std::string Coordinator::getIndividualChannels() {
 std::string Coordinator::getNodes() {
     auto* db = chem::DBHandler::GetInstance("");
     json resp = db->GetNodes();
+    const auto tx_activity = collectTxActivity(m_intermediateMap);
+    const int64_t now_ns = steadyNowNs();
 
     for (const auto& [id, node] : m_nodeMap) {
         const auto& cfg = node.getConfig();
@@ -843,6 +977,11 @@ std::string Coordinator::getNodes() {
         }
 
         resp[name]["nodeType"] = NodeTypeToString(cfg.getNodeType());
+
+        auto activity_it = tx_activity.find(id);
+        addTxActivityFields(
+            resp[name],
+            activity_it != tx_activity.end() ? activity_it->second : 0, now_ns);
     }
 
     return resp.dump();
@@ -906,6 +1045,7 @@ std::string Coordinator::getStatus() {
     resp["nodesConnected"] = static_cast<int>(m_nodeMap.size());
     resp["freqChannels"] = static_cast<int>(m_intermediateMap.size());
     resp["version"] = ACHEM_VERSION;
+    resp["sandboxEnabled"] = chem::RuntimeConfig::sandbox_enabled.load();
     resp["vehiclePollRateMs"] =
         chem::RuntimeConfig::vehicle_poll_rate_ms.load();
     resp["channelUpdateRateMs"] =

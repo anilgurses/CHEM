@@ -16,8 +16,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <thread>
 #include <tuple>
 #include <uhd/convert.hpp>
@@ -87,6 +89,7 @@ class Intermediate {
         std::vector<DestInfo> cached_destinations;
         std::vector<dArray_uptr> pre_acquired_buffers;
         int numa_node{0};
+        std::atomic<int64_t> last_tx_ns{0};
 
         WorkerContext() { queue.set_capacity(QUEUE_CAP); }
 
@@ -137,6 +140,12 @@ class Intermediate {
 
     std::map<std::pair<std::string, std::string>, chem::Channel>&
     getChannelList();
+
+    template <typename F>
+    void withChannelsExclusive(F&& fn) {
+        std::unique_lock<std::shared_mutex> guard(dest_mutex);
+        fn(m_channelMap);
+    }
 
     void addNewChannel(const std::string& source, const std::string& dest);
 
@@ -242,8 +251,24 @@ class Intermediate {
         m_workerAgeDropCount.store(0, std::memory_order_relaxed);
     }
 
+    // Sandbox mode: register virtual nodes that have no Rx/Tx endpoints.
+    // The channel cross-product is built from the sandbox node set so that
+    // path-loss and antenna calculations can still run.
+    void addSandboxNode(const std::string& nodeId, size_t numChannels);
+    void removeSandboxNode(const std::string& nodeId);
+    const std::set<std::string>& getSandboxNodes() const;
+
+    std::vector<std::pair<std::string, int64_t>> getTxActivity() const;
+
    private:
     void EmptyChannelChecker();
+
+    PathLossType currentPlType() const;
+
+    void insertChannelIfMissing(const std::string& src_id,
+                                const std::string& dest_id,
+                                uint8_t destNumCh,
+                                uint8_t srcNumCh);
 
     void printStatus();
 
@@ -289,7 +314,7 @@ class Intermediate {
 
     // Per-receiver worker contexts for parallel processing
     std::unordered_map<std::string, std::unique_ptr<WorkerContext>> m_workers;
-    std::mutex m_workers_mutex;
+    mutable std::mutex m_workers_mutex;
 
     ChannelTimingCallback m_timingCallback;
     std::atomic<bool> m_timingEnabled{false};
@@ -300,5 +325,9 @@ class Intermediate {
 
     std::atomic<size_t> m_poolDropCount{0};
     std::atomic<size_t> m_workerAgeDropCount{0};
+
+    // Sandbox mode: virtual nodes without Rx/Tx endpoints
+    std::set<std::string> m_sandboxNodes;
+    std::unordered_map<std::string, size_t> m_sandboxNumChannels;
 };
 }  // namespace chem

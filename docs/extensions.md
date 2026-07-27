@@ -32,11 +32,18 @@ Extensions are configured under the `extensions` key in `config.json`:
       "updateRateMs": 500,
       "maxDepth": 3,
       "numSamples": 100000,
+      "sceneConfig": "aerpaw",
       "referenceOrigin": {
-        "lat": 35.7272,
-        "lon": -78.6960,
-        "alt": 0.0
-      }
+        "lat": 35.72750947,
+        "lon": -78.69595819,
+        "alt": 112.0
+      },
+      "sceneOffset": {
+        "x": 118.1,
+        "y": -123.4,
+        "z": 0.0
+      },
+      "scale": 1.0
     }
   }
 }
@@ -57,7 +64,10 @@ Extensions are controlled at runtime through two coordinator commands:
   "action": "start",
   "params": {
     "serverUrl": "http://192.168.8.173:8000",
-    "referenceOrigin": {"lat": 35.7272, "lon": -78.6960, "alt": 0.0}
+    "sceneConfig": "aerpaw",
+    "referenceOrigin": {"lat": 35.72750947, "lon": -78.69595819, "alt": 112.0},
+    "sceneOffset": {"x": 118.1, "y": -123.4, "z": 0.0},
+    "scale": 1.0
   }
 }
 ```
@@ -99,7 +109,10 @@ client = ChemClient(addr="localhost", port=5000)
 # Generic extension control
 result = client.extension("sionna", "start", {
     "serverUrl": "http://localhost:8000",
-    "referenceOrigin": {"lat": 35.7272, "lon": -78.6960, "alt": 0.0},
+    "sceneConfig": "aerpaw",
+    "referenceOrigin": {"lat": 35.72750947, "lon": -78.69595819, "alt": 112.0},
+    "sceneOffset": {"x": 118.1, "y": -123.4, "z": 0.0},
+    "scale": 1.0,
 })
 
 # List all extensions and their status

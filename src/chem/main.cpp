@@ -57,6 +57,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    const bool cfgOk = chemCfg.read(fpath);
+
     chem::Logger _logger(chemCfg.getLogDirectory());
 
     std::shared_ptr<spdlog::logger> logger = spdlog::get("CHEM");
@@ -66,9 +68,28 @@ int main(int argc, char** argv) {
 
     logger->info(fmt::format("Version {}", ACHEM_VERSION));
 
-    if (chemCfg.read(fpath)) logger->debug("Parsed the configuration!");
+    if (cfgOk) logger->debug("Parsed the configuration!");
 
     logger->set_level(spdlog::level::from_str(chemCfg.getLogLevel()));
+
+    // AP_EXPENV_SESSION_ENV=Sandbox overrides config; real RF is driven by a USRP and an
+    // external channel emulator (Propsim in our use case). CHEM only computes path loss and
+    // antenna patterns; no IQ is moved inside CHEM.
+    const char* sandboxEnv = std::getenv("AP_EXPENV_SESSION_ENV");
+    const bool sandboxEnabled =
+        (sandboxEnv && std::string(sandboxEnv) == "Sandbox") ||
+        chemCfg.getSandboxEnabled();
+    if (sandboxEnabled) {
+        chem::RuntimeConfig::sandbox_enabled.store(true);
+        chem::RuntimeConfig::sandbox_update_rate_ms.store(
+            chemCfg.getSandboxUpdateRateMs());
+        std::cout << "\x1B[1;31m"
+                  << "====================================\n"
+                  << "  CHEM is running in SANDBOX mode\n"
+                  << "  [ NO IQ TRANSMISSION ]\n"
+                  << "===================================="
+                  << "\x1B[0m" << std::endl;
+    }
 
 #ifdef ENABLE_PROFILING
     LOG_WARN(
@@ -121,11 +142,21 @@ int main(int argc, char** argv) {
 
     auto coordinator = std::make_shared<chem::channel::Coordinator>(
         chemCfg.getCoordinatorIp(), chemCfg.getCoordinatorPort(), nodeList,
-        intermediateMap, propagationDefaults);
+        intermediateMap, propagationDefaults, &chemCfg);
 
     // Start extensions from config file
     coordinator->getExtensionRegistry().startFromConfig(
         chemCfg.getExtensionsConfig());
+
+    // SANDBOX_MODE env var forces the sandbox extension on regardless of
+    // config, and pushes path loss to the middleman URL from config.json.
+    if (sandboxEnabled) {
+        nlohmann::json sandboxCfg;
+        sandboxCfg["middlemanUrl"] = chemCfg.getSandboxMiddlemanUrl();
+        sandboxCfg["updateRateMs"] = chemCfg.getSandboxUpdateRateMs();
+        coordinator->getExtensionRegistry().routeCommand(
+            "sandbox", "start", sandboxCfg);
+    }
 
     // Start Channel Coordinator
     std::thread coord_th(&chem::channel::Coordinator::start, coordinator);

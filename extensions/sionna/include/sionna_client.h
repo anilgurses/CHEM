@@ -37,6 +37,7 @@ class SionnaExtension : public ChannelExtension {
    private:
     void pollLoop();
     bool createScene();
+    void fetchSceneAlignment();
     void syncPositions();
     void computeAndApplyCIR();
 
@@ -54,12 +55,27 @@ class SionnaExtension : public ChannelExtension {
     void clearExtensionFlags();
     void parseUrl(const std::string& url);
 
+    double destSampleRate(const std::string& destId, double fallback) const;
+
     std::string m_serverUrl;
     std::string m_host;
     std::string m_port;
-    double m_refLat{35.7272};
-    double m_refLon{-78.6960};
-    double m_refAlt{0.0};
+
+    std::string m_sceneConfig{"aerpaw"};
+    // scene_origin: geo reference. alt is the ellipsoidal height (HAE) of
+    // ground level; scene z=0 is this ground.
+    double m_refLat{35.72750947};
+    double m_refLon{-78.69595819};
+    double m_refAlt{112.0};
+    // scene_offset (meters): scene_xyz = ENU_meters(origin) * scale + offset.
+    double m_offsetX{118.1};
+    double m_offsetY{-123.4};
+    double m_offsetZ{0.0};
+    // scale: 1.0 because the aerpaw scene is already in meters.
+    double m_scale{1.0};
+
+    nlohmann::json m_sceneAlignment;
+
     int m_updateRateMs{500};
     int m_maxDepth{3};
     int m_numSamples{100000};

@@ -7,7 +7,8 @@
 using namespace chem;
 
 bool Config::read(std::string fpath) {
-    spdlog::get("CHEM")->info("Parsing configuration");
+    spdlog::info("Parsing configuration");
+    m_path = fpath;
     std::ifstream cfg(fpath);
     configuration = json::parse(cfg);
 
@@ -42,12 +43,44 @@ bool Config::read(std::string fpath) {
             configuration["extensions"].is_object()) {
             extensionsConfig = configuration["extensions"];
         }
+
+        // Optional: Sandbox mode
+        if (configuration.contains("sandbox") &&
+            configuration["sandbox"].is_object()) {
+            const auto& sb = configuration["sandbox"];
+            if (sb.contains("enabled") && sb["enabled"].is_boolean())
+                sandboxEnabled = sb["enabled"];
+            if (sb.contains("middlemanUrl") && sb["middlemanUrl"].is_string())
+                sandboxMiddlemanUrl = sb["middlemanUrl"];
+            if (sb.contains("updateRateMs") && sb["updateRateMs"].is_number())
+                sandboxUpdateRateMs =
+                    std::max(50, sb["updateRateMs"].get<int>());
+        }
     } catch (const std::exception& e) {
         spdlog::error(e.what());
         return false;
     }
 
     return true;
+}
+
+bool Config::save(const std::string& path) const {
+    const std::string target = path.empty() ? m_path : path;
+    if (target.empty()) {
+        spdlog::error("Config::save called with no path");
+        return false;
+    }
+    std::ofstream out(target, std::ios::trunc);
+    if (!out) {
+        spdlog::error("Could not open config file for writing: {}", target);
+        return false;
+    }
+    out << configuration.dump(4) << '\n';
+    return out.good();
+}
+
+void Config::mergePatch(const nlohmann::json& patch) {
+    configuration.merge_patch(patch);
 }
 
 const std::string& Config::getControllerIp() const { return controllerIpaddr; }
@@ -75,3 +108,11 @@ bool Config::getNumaEnabled() const { return numaEnabled; }
 const nlohmann::json& Config::getExtensionsConfig() const {
     return extensionsConfig;
 }
+
+bool Config::getSandboxEnabled() const { return sandboxEnabled; }
+
+const std::string& Config::getSandboxMiddlemanUrl() const {
+    return sandboxMiddlemanUrl;
+}
+
+int Config::getSandboxUpdateRateMs() const { return sandboxUpdateRateMs; }

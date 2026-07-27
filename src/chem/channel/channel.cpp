@@ -402,10 +402,30 @@ void Channel::processChannel(signal_v& src,
 
     const chId cir_key{params.dest_channel_index, params.src_channel_index};
     const auto taps_it = _chTaps.find(cir_key);
-    if (_cirApplyMethod != dsp::channel::CIRApplyMethod::NONE &&
-        taps_it != _chTaps.end() && !taps_it->second.empty()) {
+    const bool cir_active =
+        _cirApplyMethod != dsp::channel::CIRApplyMethod::NONE &&
+        taps_it != _chTaps.end() && !taps_it->second.empty();
+
+    // When an extension bypasses CHEM's statistical path loss and supplies
+    // CIR taps that already encode the propagation loss (e.g. ray-traced
+    // taps from Sionna), the convolution above will attenuate the signal
+    // by the CIR's tap energy 
+    float cir_loss_db = 0.0f;
+    if (cir_active && _extensionBypassesPathLoss) {
+        const size_t tap_len = taps_it->second.size();
+        // calc_power returns mean |z|^2 via VOLK; multiply by tap_len to
+        // recover the total tap energy needed for the CIR loss in dB.
+        const float tap_energy =
+            chem::dsp::signal::calc_power(taps_it->second, tap_len) *
+            static_cast<float>(tap_len);
+        if (tap_energy > 0.0f) {
+            cir_loss_db = 10.0f * std::log10(tap_energy);
+        }
+    }
+
+    if (cir_active) {
         if (_cirApplyMethod == dsp::channel::CIRApplyMethod::DIRECT_CONV) {
-            // grow to actual signal size  
+            // grow to actual signal size
             thread_local signal_v cir_out;
             if (cir_out.size() < params.s_perBuff) {
                 cir_out.resize(params.s_perBuff, fc(0.0f, 0.0f));
@@ -434,8 +454,14 @@ void Channel::processChannel(signal_v& src,
     }
 
     setPl(pl_db);
-    p_rx = p_tx - pl_db + budget.rx_gain_db + budget.rx_ant_gain_db -
-           budget.rx_cable_loss_db;  // in dBm
+    // For extension-supplied CIR taps that encode propagation loss, the
+    // signal already contains the loss after the convolution above. Treat
+    // the post-CIR power (sig_ref + cir_loss_db) as the rx_scale input so
+    // the device gains are applied on top of that loss
+    const float p_rx_input = sig_ref + cir_loss_db;
+    p_rx = p_tx + cir_loss_db - pl_db + budget.rx_gain_db +
+           budget.rx_ant_gain_db -
+           budget.rx_cable_loss_db;  // in dBFS
     // Do not allow received power to be greater than 0 dBFS
     // - Otherwise it will saturate
     p_rx = std::min(p_rx, 0.0f);
@@ -446,9 +472,17 @@ void Channel::processChannel(signal_v& src,
                                                 _noiseType, noise_figure_db);
     float meas_noise_power =
         LIN_TO_DB(chem::dsp::signal::calc_power(noise, params.s_perBuff));
-    float rx_scale_db = p_rx - sig_ref;
+    float rx_scale_db = p_rx - p_rx_input;
+    if (!std::isfinite(rx_scale_db)) {
+        LOG_WARN("P_RX",
+                 fmt::format("Non-finite rx_scale_db (p_rx={}, p_rx_input={}, "
+                             "pl_db={}); clamping to silence. Check that the "
+                             "node has RF characteristics / source power.",
+                             p_rx, p_rx_input, pl_db));
+        rx_scale_db = -300.0f;  // ~0 linear
+    }
     const float rx_scale = std::sqrt(DB_TO_LIN(rx_scale_db));
-    snr_db = sig_ref + rx_scale_db - meas_noise_power;  // in dB
+    snr_db = p_rx - meas_noise_power;  // in dB
 
     dsp::utils::fc32_mul_scalar_sum(dest, rx_scale, noise, dest,
                                     params.s_perBuff);

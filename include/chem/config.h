@@ -15,6 +15,14 @@ class Config {
 
     bool read(std::string fpath);
 
+    bool save(const std::string& path = "") const;
+
+    void mergePatch(const nlohmann::json& patch);
+
+    const nlohmann::json& raw() const { return configuration; }
+
+    const std::string& getConfigPath() const { return m_path; }
+
     const std::string& getControllerIp() const;
     const uint16_t& getControllerPort() const;
 
@@ -32,11 +40,17 @@ class Config {
     int getMaxCores() const;
     bool getNumaEnabled() const;
 
-    // Generic extensions config 
+    // Generic extensions config
     const nlohmann::json& getExtensionsConfig() const;
+
+    // Sandbox mode (path-loss only, no IQ processing)
+    bool getSandboxEnabled() const;
+    const std::string& getSandboxMiddlemanUrl() const;
+    int getSandboxUpdateRateMs() const;
 
    private:
     json configuration;
+    std::string m_path;
 
     std::string controllerIpaddr = "0.0.0.0";
     uint16_t controllerPort = 10000;
@@ -53,7 +67,12 @@ class Config {
     int maxCores = 10;
     bool numaEnabled = true;
 
-    // Extensions configuration 
+    // Extensions configuration
     nlohmann::json extensionsConfig = nlohmann::json::object();
+
+    // Sandbox mode
+    bool sandboxEnabled = false;
+    std::string sandboxMiddlemanUrl = "http://localhost:8080";
+    int sandboxUpdateRateMs = 500;
 };
 }  // namespace chem
